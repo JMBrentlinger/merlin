@@ -24,7 +24,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-
+	"encoding/base64"
 	// Mythic
 	structs "github.com/MythicMeta/MythicContainer/agent_structs"
 	"github.com/MythicMeta/MythicContainer/logging"
@@ -34,7 +34,7 @@ import (
 	"github.com/MythicAgents/merlin/Payload_Type/merlin/container/pkg/srdi"
 )
 
-var debugInfo = false
+var debugInfo = true
 
 // Build is the function Mythic calls to compile the Merlin Agent
 func Build(msg structs.PayloadBuildMessage) (response structs.PayloadBuildResponse) {
@@ -62,6 +62,15 @@ func Build(msg structs.PayloadBuildMessage) (response structs.PayloadBuildRespon
 		err := fmt.Errorf("%s: expected one C2Profile but received %d: %+v", pkg, len(msg.C2Profiles), msg.C2Profiles)
 		response.BuildStdErr = err.Error()
 		logging.LogError(err, "returning with error")
+		return
+	}
+
+	// Get C2 profile name to handle different profiles
+	profileName := msg.C2Profiles[0].Name
+
+	// Handle PubSub profile separately
+	if profileName == "pubsub" {
+		buildPubSubAgent(msg, &response)
 		return
 	}
 
@@ -549,7 +558,7 @@ func NewPayload() (structs.PayloadType, error) {
 		CanBeWrappedByTheFollowingPayloadTypes: []string{"service_wrapper", "scarecrow_wrapper"},
 		SupportsDynamicLoading:                 false,
 		Description:                            "A port of Merlin from https://www.github.com/Ne0nd0g/merlin to Mythic",
-		SupportedC2Profiles:                    []string{"http"},
+		SupportedC2Profiles:                    []string{"http", "pubsub"},
 		MythicEncryptsData:                     true,
 	}
 
@@ -714,4 +723,322 @@ func newBuildParameterChooseOneQuick(name string, description string, required b
 		choices,
 		[]structs.BuildParameterDictionary{},
 	)
+}
+
+// buildPubSubAgent builds a Merlin agent configured for GCP Pub/Sub C2 transport
+func buildPubSubAgent(msg structs.PayloadBuildMessage, response *structs.PayloadBuildResponse) {
+	pkg := "mythic/container/payload/build/buildPubSubAgent()"
+
+	// Extract PubSub C2 parameters
+	gcpProjectID, ok := msg.C2Profiles[0].Parameters["gcp_project_id"]
+	if !ok {
+		err := fmt.Errorf("%s: the 'gcp_project_id' key was not found in the C2 profile parameters", pkg)
+		response.BuildStdErr = err.Error()
+		logging.LogError(err, "returning with error")
+		return
+	}
+
+	serverToAgentTopic, ok := msg.C2Profiles[0].Parameters["server_to_agent_topic"]
+	if !ok {
+		err := fmt.Errorf("%s: the 'server_to_agent_topic' key was not found in the C2 profile parameters", pkg)
+		response.BuildStdErr = err.Error()
+		logging.LogError(err, "returning with error")
+		return
+	}
+
+	agentToServerTopic, ok := msg.C2Profiles[0].Parameters["agent_to_server_topic"]
+	if !ok {
+		err := fmt.Errorf("%s: the 'agent_to_server_topic' key was not found in the C2 profile parameters", pkg)
+		response.BuildStdErr = err.Error()
+		logging.LogError(err, "returning with error")
+		return
+	}
+
+	serverToAgentSub, ok := msg.C2Profiles[0].Parameters["server_to_agent_subscription"]
+	if !ok {
+		err := fmt.Errorf("%s: the 'server_to_agent_subscription' key was not found in the C2 profile parameters", pkg)
+		response.BuildStdErr = err.Error()
+		logging.LogError(err, "returning with error")
+		return
+	}
+
+	agentToServerSub, ok := msg.C2Profiles[0].Parameters["agent_to_server_subscription"]
+	if !ok {
+		err := fmt.Errorf("%s: the 'agent_to_server_subscription' key was not found in the C2 profile parameters", pkg)
+		response.BuildStdErr = err.Error()
+		logging.LogError(err, "returning with error")
+		return
+	}
+
+	// Get callback interval and jitter
+	v, ok := msg.C2Profiles[0].Parameters["callback_interval"]
+	if !ok {
+		err := fmt.Errorf("%s: the 'callback_interval' key was not found in the C2 profile parameters", pkg)
+		response.BuildStdErr = err.Error()
+		logging.LogError(err, "returning with error")
+		return
+	}
+	sleep := v.(float64)
+
+	v, ok = msg.C2Profiles[0].Parameters["callback_jitter"]
+	if !ok {
+		err := fmt.Errorf("%s: the 'callback_jitter' key was not found in the C2 profile parameters", pkg)
+		response.BuildStdErr = err.Error()
+		logging.LogError(err, "returning with error")
+		return
+	}
+	jitter := v.(float64)
+	skew := (jitter / 100) * (sleep * 1000)
+
+	// Get killdate
+	v, ok = msg.C2Profiles[0].Parameters["killdate"]
+	if !ok {
+		err := fmt.Errorf("%s: the 'killdate' key was not found in the C2 profile parameters", pkg)
+		response.BuildStdErr = err.Error()
+		logging.LogError(err, "returning with error")
+		return
+	}
+	kill, err := time.Parse(time.RFC3339, fmt.Sprintf("%sT00:00:00.000Z", v.(string)))
+	if err != nil {
+		err = fmt.Errorf("%s: there was an error parsing the killdate '%s': %s", pkg, v, err)
+		response.BuildStdErr = fmt.Sprintf("there was an error parsing the killdate \"%s\": %s", v, err)
+		logging.LogError(err, "returning with error")
+		return
+	}
+
+	// Get agent service account credentials (file upload)
+	credentialsData, ok := msg.C2Profiles[0].Parameters["agent_service_account_credential"]
+	if !ok {
+		err := fmt.Errorf("%s: the 'agent_service_account_credential' key was not found in the C2 profile parameters", pkg)
+		response.BuildStdErr = err.Error()
+		logging.LogError(err, "returning with error")
+		return
+	}
+
+        // The credentials parameter contains a UUID reference to the uploaded file
+        // We need to fetch the actual file content using Mythic RPC
+        credentialsUUID := credentialsData.(string)
+
+        // Download the credentials file content
+        fileResp, err := mythicrpc.SendMythicRPCFileGetContent(mythicrpc.MythicRPCFileGetContentMessage{
+                AgentFileID: credentialsUUID,
+        })
+        if err != nil {
+                err = fmt.Errorf("%s: failed to download credentials file: %s", pkg, err)
+                response.BuildStdErr = err.Error()
+                logging.LogError(err, "returning with error")
+                return
+        }
+        if !fileResp.Success {
+                err = fmt.Errorf("%s: failed to get credentials file content: %s", pkg, fileResp.Error)
+                response.BuildStdErr = err.Error()
+                logging.LogError(err, "returning with error")
+                return
+        }
+
+        // The file content is already in bytes, convert to string for embedding
+//        credentialsJSON := string(fileResp.Content)
+	  credentialsJSON := base64.StdEncoding.EncodeToString(fileResp.Content)
+
+	// Get build parameters
+	verbose, err := msg.BuildParameters.GetBooleanArg("verbose")
+	if err != nil {
+		err = fmt.Errorf("%s: there was an error getting the 'verbose' key from BuildParameters: %s", pkg, err)
+		response.BuildStdErr = err.Error()
+		logging.LogError(err, "returning with error")
+		return
+	}
+
+	debug, err := msg.BuildParameters.GetBooleanArg("debug")
+	if err != nil {
+		err = fmt.Errorf("%s: there was an error getting the 'debug' key from BuildParameters: %s", pkg, err)
+		response.BuildStdErr = err.Error()
+		logging.LogError(err, "returning with error")
+		return
+	}
+
+	arch, err := msg.BuildParameters.GetStringArg("arch")
+	if err != nil {
+		err = fmt.Errorf("%s: there was an error getting the 'arch' key from BuildParameters: %s", pkg, err)
+		response.BuildStdErr = err.Error()
+		logging.LogError(err, "returning with error")
+		return
+	}
+
+	mode, err := msg.BuildParameters.GetStringArg("buildmode")
+	if err != nil {
+		err = fmt.Errorf("%s: there was an error getting the 'buildmode' key from BuildParameters: %s", pkg, err)
+		response.BuildStdErr = err.Error()
+		logging.LogError(err, "returning with error")
+		return
+	}
+
+	maxArg, err := msg.BuildParameters.GetStringArg("maxretry")
+	if err != nil {
+		err = fmt.Errorf("%s: there was an error getting the 'maxretry' key from BuildParameters: %s", pkg, err)
+		response.BuildStdErr = err.Error()
+		logging.LogError(err, "returning with error")
+		return
+	}
+
+	garble, err := msg.BuildParameters.GetBooleanArg("garble")
+	if err != nil {
+		err = fmt.Errorf("%s: there was an error getting the 'garble' key from BuildParameters: %s", pkg, err)
+		response.BuildStdErr = err.Error()
+		logging.LogError(err, "returning with error")
+		return
+	}
+
+	// Normalize OS name
+	switch msg.SelectedOS {
+	case structs.SUPPORTED_OS_MACOS:
+		msg.SelectedOS = "darwin"
+	default:
+		msg.SelectedOS = strings.ToLower(msg.SelectedOS)
+	}
+
+	// Build ldflags for PubSub agent - these values will be injected at compile time
+	ldflags := "-s -w"
+	ldflags += fmt.Sprintf(" -X \"main.payloadID=%s\"", msg.PayloadUUID)
+	ldflags += fmt.Sprintf(" -X \"main.profile=%s\"", msg.C2Profiles[0].Name)
+	ldflags += fmt.Sprintf(" -X \"main.gcpProjectID=%s\"", gcpProjectID)
+	ldflags += fmt.Sprintf(" -X \"main.serverToAgentTopic=%s\"", serverToAgentTopic)
+	ldflags += fmt.Sprintf(" -X \"main.agentToServerTopic=%s\"", agentToServerTopic)
+	ldflags += fmt.Sprintf(" -X \"main.serverToAgentSub=%s\"", serverToAgentSub)
+	ldflags += fmt.Sprintf(" -X \"main.agentToServerSub=%s\"", agentToServerSub)
+	ldflags += fmt.Sprintf(" -X \"main.credentialsJSON=%s\"", credentialsJSON)
+	ldflags += fmt.Sprintf(" -X \"main.sleep=%ds\"", int(sleep))
+	ldflags += fmt.Sprintf(" -X \"main.skew=%d\"", int(skew))
+	ldflags += fmt.Sprintf(" -X \"main.killdate=%d\"", kill.Unix())
+	ldflags += fmt.Sprintf(" -X \"main.maxretry=%s\"", maxArg)
+	ldflags += fmt.Sprintf(" -X \"main.verbose=%t\"", verbose)
+	ldflags += fmt.Sprintf(" -X \"main.debug=%t\"", debug)
+
+	if msg.SelectedOS == "windows" && mode == "default" && !verbose && !debug {
+		ldflags += " -H=windowsgui"
+	}
+	ldflags += " -buildid="
+
+	// Build tags
+	tags := "-tags=mythic"
+
+	// Setup Go build command - include pubsub files
+	goArgs := []string{"build", "-o", "merlin.bin"}
+	if mode == "shared" || mode == "raw" {
+		tags += ",shared"
+		goArgs = append(goArgs, []string{"-buildmode=c-shared", "-ldflags", ldflags, tags, "."}...)
+	} else {
+		goArgs = append(goArgs, []string{tags, fmt.Sprintf("-ldflags=%s", ldflags), "main.go", "pubsub_transport.go", "pubsub_client.go", "shared.go"}...)
+//		goArgs = append(goArgs, []string{tags, "-ldflags", ldflags, "main.go", "pubsub_transport.go", "pubsub_client.go", "shared.go"}...)
+//		goArgs = append(goArgs, []string{tags, "-ldflags", ldflags}...)
+//		goArgs = append(goArgs, []string{"-buildmode=default", "-ldflags", ldflags, tags, "main.go", "pubsub_transport.go", "pubsub_client.go"}...)
+	}
+
+	bin := "go"
+	if garble {
+		bin = "garble"
+		goArgs = append([]string{"-tiny", "-literals", "-seed", "random"}, goArgs...)
+	}
+
+	if debugInfo {
+		fmt.Printf("[DEBUG] buildPubSubAgent(): command: %s %s\n", bin, goArgs)
+	}
+
+	// Tell Mythic we're done with configuration
+	resp, err := mythicrpc.SendMythicRPCPayloadUpdateBuildStep(
+		mythicrpc.MythicRPCPayloadUpdateBuildStepMessage{
+			PayloadUUID: msg.PayloadUUID,
+			StepName:    "Configuring",
+			StepStdout:  fmt.Sprintf("Successfully configured PubSub agent\n%s", goArgs),
+			StepStderr:  "",
+			StepSuccess: true,
+		},
+	)
+	if err != nil {
+		err = fmt.Errorf("%s: there was an error sending the MythicRPCPayloadUpdateBuildStepMessage: %s, %s", pkg, err, resp.Error)
+		logging.LogError(err, "continuing")
+	}
+
+	// Set Go environment variables
+	err = os.Setenv("GOOS", msg.SelectedOS)
+	if err != nil {
+		response.BuildMessage = "there was an error compiling the agent"
+		response.BuildStdErr = fmt.Sprintf("there was an error setting the GOOS environment variable to %s: %s", msg.SelectedOS, err)
+		mythicrpc.SendMythicRPCPayloadUpdateBuildStep(
+			mythicrpc.MythicRPCPayloadUpdateBuildStepMessage{
+				PayloadUUID: msg.PayloadUUID,
+				StepName:    "Compiling",
+				StepStdout:  "",
+				StepStderr:  response.BuildStdErr,
+				StepSuccess: false,
+			},
+		)
+		return
+	}
+
+	err = os.Setenv("GOARCH", arch)
+	if err != nil {
+		response.BuildMessage = "there was an error compiling the agent"
+		response.BuildStdErr = fmt.Sprintf("there was an error setting the GOARCH environment variable to %s: %s", arch, err)
+		mythicrpc.SendMythicRPCPayloadUpdateBuildStep(
+			mythicrpc.MythicRPCPayloadUpdateBuildStepMessage{
+				PayloadUUID: msg.PayloadUUID,
+				StepName:    "Compiling",
+				StepStdout:  "",
+				StepStderr:  response.BuildStdErr,
+				StepSuccess: false,
+			},
+		)
+		return
+	}
+
+	err = os.Setenv("CGO_ENABLED", "0")
+	if err != nil {
+		response.BuildMessage = "there was an error compiling the agent"
+		response.BuildStdErr = fmt.Sprintf("there was an error setting CGO_ENABLED: %s", err)
+		return
+	}
+
+	// Execute build command
+	command := exec.Command(bin, goArgs...)
+	command.Dir = filepath.Join("/Mythic/agent")
+
+	out, err := command.CombinedOutput()
+	if err != nil {
+		response.BuildMessage = "there was an error compiling the agent"
+		response.BuildStdErr = fmt.Sprintf("Error: %s\nOutput: %s", err, string(out))
+		mythicrpc.SendMythicRPCPayloadUpdateBuildStep(
+			mythicrpc.MythicRPCPayloadUpdateBuildStepMessage{
+				PayloadUUID: msg.PayloadUUID,
+				StepName:    "Compiling",
+				StepStdout:  "",
+				StepStderr:  response.BuildStdErr,
+				StepSuccess: false,
+			},
+		)
+		return
+	}
+
+	// Build succeeded
+	mythicrpc.SendMythicRPCPayloadUpdateBuildStep(
+		mythicrpc.MythicRPCPayloadUpdateBuildStepMessage{
+			PayloadUUID: msg.PayloadUUID,
+			StepName:    "Compiling",
+			StepStdout:  string(out),
+			StepStderr:  "",
+			StepSuccess: true,
+		},
+	)
+
+	// Read the compiled binary
+	payload, err := os.ReadFile(filepath.Join("/Mythic/agent", "merlin.bin"))
+	if err != nil {
+		response.BuildMessage = "there was an error reading the compiled agent"
+		response.BuildStdErr = err.Error()
+		return
+	}
+
+	response.Payload = &payload
+	response.BuildMessage = fmt.Sprintf("PubSub agent built successfully for %s/%s", msg.SelectedOS, arch)
+	response.Success = true
 }

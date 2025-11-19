@@ -1,0 +1,8 @@
+{
+  "project_id": "PUT_YOUR_GCP_PROJECT_ID_HERE",
+  "tasks_topic": "mythic-tasks",
+  "results_topic": "mythic-results",
+  "subscription_id": "PUT_UNIQUE_ID_HERE",
+  "credentials_file": "PUT_PATH_TO_SERVICE_ACCOUNT_JSON_HERE",
+  "credentials_json": ""
+}

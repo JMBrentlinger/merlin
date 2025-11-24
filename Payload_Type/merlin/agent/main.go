@@ -27,6 +27,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	// 3rd Party
 	"github.com/fatih/color"
@@ -240,6 +241,24 @@ func main() {
 
 		if core.Verbose {
 			color.Green("[+] PubSub client initialized successfully")
+		}
+
+		// For PubSub (asynchronous client), manually start the listener
+		// run.Run() only calls Listen() for synchronous clients
+		if client.Synchronous() == false {
+			go func() {
+				if core.Verbose {
+					color.Cyan("[*] Starting async listener loop for PubSub")
+				}
+				for {
+					_, err := client.Listen()
+					if err != nil && core.Verbose {
+						color.Red(fmt.Sprintf("[-] Listen error: %v", err))
+					}
+					// Brief sleep to avoid tight loop
+					time.Sleep(100 * time.Millisecond)
+				}
+			}()
 		}
 	default:
 		if core.Verbose {

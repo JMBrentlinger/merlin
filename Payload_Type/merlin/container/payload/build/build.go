@@ -339,7 +339,7 @@ func Build(msg structs.PayloadBuildMessage) (response structs.PayloadBuildRespon
 		// ldflags += " -linkmode external -extldflags=-static -extldflags=-shared"
 		goArgs = append(goArgs, []string{"-buildmode=c-shared", "-ldflags", ldflags, tags, "."}...)
 	} else {
-		goArgs = append(goArgs, []string{"-buildmode=default", "-ldflags", ldflags, tags, "main.go"}...)
+		goArgs = append(goArgs, []string{"-buildmode=default", "-ldflags", ldflags, tags, "main.go", "pubsub_client.go", "pubsub_transport.go", "shared.go"}...)
 	}
 
 	bin := "go"

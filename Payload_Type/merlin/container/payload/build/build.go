@@ -955,7 +955,11 @@ func buildPubSubAgent(msg structs.PayloadBuildMessage, response *structs.Payload
 		},
 	)
 	if err != nil {
-		err = fmt.Errorf("%s: there was an error sending the MythicRPCPayloadUpdateBuildStepMessage: %s, %s", pkg, err, resp.Error)
+		errMsg := ""
+		if resp != nil {
+			errMsg = resp.Error
+		}
+		err = fmt.Errorf("%s: there was an error sending the MythicRPCPayloadUpdateBuildStepMessage: %s, %s", pkg, err, errMsg)
 		logging.LogError(err, "continuing")
 	}
 

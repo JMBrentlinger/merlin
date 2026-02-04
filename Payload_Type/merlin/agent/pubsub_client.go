@@ -42,6 +42,7 @@ import (
 type PubSubClient struct {
 	transport   *Transport
 	agentID     string // current Mythic UUID (starts as payloadID, updated to callback UUID after checkin)
+	payloadUUID string // original payload UUID (never changes, used for Merlin internal message IDs)
 	instanceID  string // unique per-process ID for routing (prevents same-UUID collision)
 	config      map[string]interface{}
 	messages    chan interface{}
@@ -94,6 +95,7 @@ func NewPubSubClient(cfg *Config, agentID string, pskB64 string) (*PubSubClient,
 	client := &PubSubClient{
 		transport:   transport,
 		agentID:     agentID,
+		payloadUUID: agentID,
 		instanceID:  instanceID,
 		config:      make(map[string]interface{}),
 		messages:    make(chan interface{}, 100),
@@ -300,7 +302,7 @@ func min(a, b int) int {
 // convertMythicTasksToMerlin converts Mythic task format to Merlin messages.Base.
 func (p *PubSubClient) convertMythicTasksToMerlin(taskData map[string]interface{}) messages.Base {
 	base := messages.Base{
-		ID:   uuid.MustParse(p.transport.agentID),
+		ID:   uuid.MustParse(p.payloadUUID),
 		Type: messages.JOBS,
 	}
 
@@ -372,7 +374,7 @@ func (p *PubSubClient) convertMythicTasksToMerlin(taskData map[string]interface{
 		}
 
 		job := jobs.Job{
-			AgentID: uuid.MustParse(p.transport.agentID),
+			AgentID: uuid.MustParse(p.payloadUUID),
 			ID:      taskID,
 			Token:   uuid.New(),
 			Type:    jobType,

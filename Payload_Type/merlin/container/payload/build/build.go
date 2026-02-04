@@ -559,7 +559,8 @@ func NewPayload() (structs.PayloadType, error) {
 		SupportsDynamicLoading:                 false,
 		Description:                            "A port of Merlin from https://www.github.com/Ne0nd0g/merlin to Mythic",
 		SupportedC2Profiles:                    []string{"http", "pubsub"},
-		MythicEncryptsData:                     true,
+		TranslationContainerName:               "pubsub_translator",
+		MythicEncryptsData:                     false,
 	}
 
 	// Create the build parameters

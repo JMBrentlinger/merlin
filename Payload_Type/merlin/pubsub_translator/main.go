@@ -50,12 +50,13 @@ var merlinPubSubTranslator = translationstructs.TranslationContainer{
 		return resp
 	},
 
-	// No custom crypto; Mythic/encryption profiles handle that. Return empty keys.
+	// No encryption — return nil keys so Mythic delegates entirely
+	// to this translation container for encoding/decoding.
 	GenerateEncryptionKeysFunc: func(input translationstructs.TrGenerateEncryptionKeysMessage) translationstructs.TrGenerateEncryptionKeysMessageResponse {
 		return translationstructs.TrGenerateEncryptionKeysMessageResponse{
 			Success:       true,
-			EncryptionKey: []byte{},
-			DecryptionKey: []byte{},
+			EncryptionKey: nil,
+			DecryptionKey: nil,
 		}
 	},
 }

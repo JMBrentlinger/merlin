@@ -171,6 +171,24 @@ func (t *Transport) Send(data map[string]interface{}) error {
 	return err
 }
 
+// SendRaw publishes a pre-built base64 string (full Mythic frame) without JSON-marshaling
+// or re-encoding the message body. Used for encrypted staging and encrypted comms.
+func (t *Transport) SendRaw(base64Message string) error {
+	wrapper := map[string]interface{}{
+		"message":   base64Message,
+		"sender_id": t.instanceID,
+		"client_id": t.agentID,
+		"to_server": true,
+	}
+	wrapperData, err := json.Marshal(wrapper)
+	if err != nil {
+		return fmt.Errorf("failed to marshal wrapper: %w", err)
+	}
+	result := t.topic.Publish(t.ctx, &pubsub.Message{Data: wrapperData})
+	_, err = result.Get(t.ctx)
+	return err
+}
+
 // Close cleanup
 func (t *Transport) Close() error {
 	t.cancel()

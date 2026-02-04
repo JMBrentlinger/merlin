@@ -339,7 +339,7 @@ func Build(msg structs.PayloadBuildMessage) (response structs.PayloadBuildRespon
 		// ldflags += " -linkmode external -extldflags=-static -extldflags=-shared"
 		goArgs = append(goArgs, []string{"-buildmode=c-shared", "-ldflags", ldflags, tags, "."}...)
 	} else {
-		goArgs = append(goArgs, []string{"-buildmode=default", "-ldflags", ldflags, tags, "main.go", "pubsub_client.go", "pubsub_transport.go", "shared.go"}...)
+		goArgs = append(goArgs, []string{"-buildmode=default", "-ldflags", ldflags, tags, "main.go", "pubsub_client.go", "pubsub_transport.go", "pubsub_crypto.go", "shared.go"}...)
 	}
 
 	bin := "go"
@@ -559,8 +559,7 @@ func NewPayload() (structs.PayloadType, error) {
 		SupportsDynamicLoading:                 false,
 		Description:                            "A port of Merlin from https://www.github.com/Ne0nd0g/merlin to Mythic",
 		SupportedC2Profiles:                    []string{"http", "pubsub"},
-		TranslationContainerName:               "pubsub_translator",
-		MythicEncryptsData:                     false,
+		MythicEncryptsData:                     true,
 	}
 
 	// Create the build parameters
@@ -898,6 +897,26 @@ func buildPubSubAgent(msg structs.PayloadBuildMessage, response *structs.Payload
 		msg.SelectedOS = strings.ToLower(msg.SelectedOS)
 	}
 
+	// Extract AESPSK encryption key (same pattern as HTTP profile)
+	crypto, ok := msg.C2Profiles[0].Parameters["AESPSK"]
+	if !ok {
+		err := fmt.Errorf("%s: the 'AESPSK' key was not found in the C2 profile parameters", pkg)
+		response.BuildStdErr = err.Error()
+		logging.LogError(err, "returning with error")
+		return
+	}
+	encType := crypto.(map[string]interface{})["value"].(string)
+	var pubsubPSK interface{}
+	if encType == "aes256_hmac" {
+		pubsubPSK, ok = crypto.(map[string]interface{})["enc_key"]
+		if !ok {
+			err := fmt.Errorf("%s: the 'enc_key' key was not found in the AESPSK parameters", pkg)
+			response.BuildStdErr = err.Error()
+			logging.LogError(err, "returning with error")
+			return
+		}
+	}
+
 	// Build ldflags for PubSub agent - these values will be injected at compile time
 	ldflags := "-s -w"
 	ldflags += fmt.Sprintf(" -X \"main.payloadID=%s\"", msg.PayloadUUID)
@@ -914,6 +933,9 @@ func buildPubSubAgent(msg structs.PayloadBuildMessage, response *structs.Payload
 	ldflags += fmt.Sprintf(" -X \"main.maxretry=%s\"", maxArg)
 	ldflags += fmt.Sprintf(" -X \"main.verbose=%t\"", verbose)
 	ldflags += fmt.Sprintf(" -X \"main.debug=%t\"", debug)
+	if encType == "aes256_hmac" && pubsubPSK != nil {
+		ldflags += fmt.Sprintf(" -X \"main.psk=%s\"", pubsubPSK)
+	}
 
 	if msg.SelectedOS == "windows" && mode == "default" && !verbose && !debug {
 		ldflags += " -H=windowsgui"
@@ -929,7 +951,7 @@ func buildPubSubAgent(msg structs.PayloadBuildMessage, response *structs.Payload
 		tags += ",shared"
 		goArgs = append(goArgs, []string{"-buildmode=c-shared", "-ldflags", ldflags, tags, "."}...)
 	} else {
-		goArgs = append(goArgs, []string{tags, fmt.Sprintf("-ldflags=%s", ldflags), "main.go", "pubsub_transport.go", "pubsub_client.go", "shared.go"}...)
+		goArgs = append(goArgs, []string{tags, fmt.Sprintf("-ldflags=%s", ldflags), "main.go", "pubsub_transport.go", "pubsub_client.go", "pubsub_crypto.go", "shared.go"}...)
 //		goArgs = append(goArgs, []string{tags, "-ldflags", ldflags, "main.go", "pubsub_transport.go", "pubsub_client.go", "shared.go"}...)
 //		goArgs = append(goArgs, []string{tags, "-ldflags", ldflags}...)
 //		goArgs = append(goArgs, []string{"-buildmode=default", "-ldflags", ldflags, tags, "main.go", "pubsub_transport.go", "pubsub_client.go"}...)

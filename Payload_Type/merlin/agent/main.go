@@ -303,7 +303,7 @@ func main() {
 		}
 
 		// Create pubsub client using the config and agent ID (use payloadID for Mythic)
-		client, err = NewPubSubClient(&pubsubConfig, payloadID)
+		client, err = NewPubSubClient(&pubsubConfig, payloadID, psk)
 		if err != nil {
 			if core.Verbose {
 				color.Red(fmt.Sprintf("failed to create pubsub client: %s", err.Error()))

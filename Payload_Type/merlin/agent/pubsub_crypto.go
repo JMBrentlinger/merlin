@@ -59,7 +59,7 @@ func pkcs7Unpad(data []byte) ([]byte, error) {
 }
 
 // aesEncrypt encrypts plaintext using AES-256-CBC with HMAC-SHA256.
-// Returns: IV[16] + ciphertext + HMAC[32]  (Mythic's aes256_hmac format)
+// Returns: IV[16] + ciphertext + HMAC[32]
 func aesEncrypt(key, plaintext []byte) ([]byte, error) {
 	if len(key) != 32 {
 		return nil, fmt.Errorf("aesEncrypt: key must be 32 bytes, got %d", len(key))
@@ -93,7 +93,7 @@ func aesEncrypt(key, plaintext []byte) ([]byte, error) {
 }
 
 // aesDecrypt decrypts data in the format: IV[16] + ciphertext + HMAC[32]
-// using AES-256-CBC with HMAC-SHA256 verification (Mythic's aes256_hmac format).
+// using AES-256-CBC with HMAC-SHA256 verification.
 func aesDecrypt(key, data []byte) ([]byte, error) {
 	if len(key) != 32 {
 		return nil, fmt.Errorf("aesDecrypt: key must be 32 bytes, got %d", len(key))

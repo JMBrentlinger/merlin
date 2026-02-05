@@ -25,17 +25,16 @@ type Transport struct {
 
 // Config for connecting to GCP from laptop/PC
 type Config struct {
-	ProjectID       string `json:"project_id"`        // GCP project ID
-	TasksTopic      string `json:"tasks_topic"`       // Topic Mythic publishes to
-	ResultsTopic    string `json:"results_topic"`     // Topic Agent publishes to
-	SubscriptionID  string `json:"subscription_id"`   // Unique subscription per agent
-	CredentialsFile string `json:"credentials_file"`  // Path to service account JSON key
-	CredentialsJSON string `json:"credentials_json"`  // OR embedded JSON string
+	ProjectID       string `json:"project_id"`       // GCP project ID
+	TasksTopic      string `json:"tasks_topic"`      // Topic Mythic publishes to
+	ResultsTopic    string `json:"results_topic"`    // Topic Agent publishes to
+	SubscriptionID  string `json:"subscription_id"`  // Shared subscription for all agents
+	CredentialsFile string `json:"credentials_file"` // Path to service account JSON key
+	CredentialsJSON string `json:"credentials_json"` // OR embedded JSON string
 }
 
 // NewTransport creates a transport that connects to GCP from anywhere.
-// instanceID is a unique-per-process identifier used to create a filtered subscription
-// so that two agents sharing the same Mythic UUID do not collide.
+// Uses a shared subscription - agent filters messages locally by instanceID.
 func NewTransport(cfg *Config, instanceID, agentID string) (*Transport, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -62,31 +61,31 @@ func NewTransport(cfg *Config, instanceID, agentID string) (*Transport, error) {
 		return nil, err
 	}
 
-	// Per-instance subscription: mythic-tasks-sub-{instanceID}
-	// This ensures two agents with the same UUID get separate subscriptions.
-	subName := fmt.Sprintf("mythic-tasks-sub-%s", instanceID)
-	filter := fmt.Sprintf("attributes.instance_id = \"%s\"", instanceID)
+	// Use shared subscription for all agents (no per-agent subscription creation)
+	subName := cfg.SubscriptionID
+	if subName == "" {
+		subName = "mythic-tasks-sub" // Default shared subscription name
+	}
 
 	sub := client.Subscription(subName)
 	exists, err := sub.Exists(ctx)
 	if err != nil {
 		cancel()
 		client.Close()
-		return nil, err
+		return nil, fmt.Errorf("failed to check subscription %s: %w", subName, err)
 	}
 
 	if !exists {
-		// Create filtered subscription
+		// Create shared subscription if it doesn't exist (no filter)
 		tasksTopic := client.Topic(cfg.TasksTopic)
 		sub, err = client.CreateSubscription(ctx, subName, pubsub.SubscriptionConfig{
 			Topic:       tasksTopic,
 			AckDeadline: 60 * time.Second,
-			Filter:      filter,
 		})
 		if err != nil {
 			cancel()
 			client.Close()
-			return nil, err
+			return nil, fmt.Errorf("failed to create subscription %s: %w", subName, err)
 		}
 	}
 
@@ -114,9 +113,18 @@ func NewTransport(cfg *Config, instanceID, agentID string) (*Transport, error) {
 	}, nil
 }
 
-// Listen starts receiving tasks from Mythic server
+// Listen starts receiving tasks from Mythic server.
+// Filters messages locally - only processes messages with matching instanceID.
 func (t *Transport) Listen(handler func(task map[string]interface{}) map[string]interface{}) error {
 	return t.sub.Receive(t.ctx, func(ctx context.Context, msg *pubsub.Message) {
+		// Check if this message is for us (filter by instance_id attribute)
+		targetInstance := msg.Attributes["instance_id"]
+		if targetInstance != "" && targetInstance != t.instanceID {
+			// Not for us - ignore (Nack so another agent can get it)
+			msg.Nack()
+			return
+		}
+
 		// Parse incoming task
 		var task map[string]interface{}
 		if err := json.Unmarshal(msg.Data, &task); err != nil {

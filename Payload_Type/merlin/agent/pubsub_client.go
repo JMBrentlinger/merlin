@@ -72,7 +72,6 @@ func NewPubSubClient(cfg *Config, agentID string, pskB64 string, encMode string)
 	}
 
 	// Handle encryption mode
-	// RSA mode takes priority (like HTTP profile) - ignore PSK if RSA is enabled
 	var pskKey []byte
 	if encMode == "" {
 		encMode = "aes256_hmac" // Default to PSK mode for backward compatibility
@@ -95,12 +94,8 @@ func NewPubSubClient(cfg *Config, agentID string, pskB64 string, encMode string)
 			color.Green("[+] AES-256 PSK loaded successfully (static PSK mode)")
 		}
 	case "rsa":
-		// RSA mode - ignore any embedded PSK, will obtain key via RSA exchange
 		if core.Verbose {
 			color.Cyan("[*] RSA key exchange mode — will perform staging to obtain AES key")
-			if pskB64 != "" {
-				color.Cyan("[*] Note: Embedded PSK ignored, using RSA key exchange instead")
-			}
 		}
 	case "none":
 		if core.Verbose {

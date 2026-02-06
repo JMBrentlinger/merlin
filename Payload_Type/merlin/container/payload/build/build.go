@@ -917,17 +917,16 @@ func buildPubSubAgent(msg structs.PayloadBuildMessage, response *structs.Payload
 		}
 	}
 
-	// Determine final encryption mode based on AESPSK and key_exchange parameters
 	// - aes256_hmac: use embedded PSK
-	// - none + rsa: RSA key exchange
-	// - none + none: no encryption (plaintext)
+	// - none + encrypted_exchange_check=true: RSA key exchange
+	// - none + encrypted_exchange_check=false: no encryption (plaintext)
 	finalEncMode := encType
 	if encType == "none" {
-		keyExchange := "rsa" // default to RSA staging
-		if keyExchangeParam, ok := msg.C2Profiles[0].Parameters["key_exchange"]; ok {
-			keyExchange = keyExchangeParam.(string)
+		encryptedExchange := true // default to RSA staging
+		if param, ok := msg.C2Profiles[0].Parameters["encrypted_exchange_check"]; ok {
+			encryptedExchange = param.(bool)
 		}
-		if keyExchange == "rsa" {
+		if encryptedExchange {
 			finalEncMode = "rsa"
 		} else {
 			finalEncMode = "none" // no encryption

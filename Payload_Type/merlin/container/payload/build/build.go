@@ -917,20 +917,23 @@ func buildPubSubAgent(msg structs.PayloadBuildMessage, response *structs.Payload
 		}
 	}
 
-	// - aes256_hmac: use embedded PSK
-	// - none + encrypted_exchange_check=true: RSA key exchange
-	// - none + encrypted_exchange_check=false: no encryption (plaintext)
-	finalEncMode := encType
-	if encType == "none" {
-		encryptedExchange := true // default to RSA staging
-		if param, ok := msg.C2Profiles[0].Parameters["encrypted_exchange_check"]; ok {
-			encryptedExchange = param.(bool)
-		}
-		if encryptedExchange {
-			finalEncMode = "rsa"
-		} else {
-			finalEncMode = "none" // no encryption
-		}
+	// Determine final encryption mode based on AESPSK and encrypted_exchange_check
+	// Toggle takes priority (like HTTP profile):
+	// - encrypted_exchange_check=true: RSA key exchange (regardless of AESPSK)
+	// - encrypted_exchange_check=false + aes256_hmac: use embedded PSK
+	// - encrypted_exchange_check=false + none: plaintext
+	encryptedExchange := true // default to RSA staging
+	if param, ok := msg.C2Profiles[0].Parameters["encrypted_exchange_check"]; ok {
+		encryptedExchange = param.(bool)
+	}
+
+	var finalEncMode string
+	if encryptedExchange {
+		finalEncMode = "rsa" // RSA key exchange (toggle ON)
+	} else if encType == "aes256_hmac" {
+		finalEncMode = "aes256_hmac" // Use embedded PSK (toggle OFF)
+	} else {
+		finalEncMode = "none" // Plaintext (toggle OFF + no PSK)
 	}
 
 	// Build ldflags for PubSub agent - these values will be injected at compile time

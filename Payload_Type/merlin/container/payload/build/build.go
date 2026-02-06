@@ -917,6 +917,23 @@ func buildPubSubAgent(msg structs.PayloadBuildMessage, response *structs.Payload
 		}
 	}
 
+	// Determine final encryption mode based on AESPSK and key_exchange parameters
+	// - aes256_hmac: use embedded PSK
+	// - none + rsa: RSA key exchange
+	// - none + none: no encryption (plaintext)
+	finalEncMode := encType
+	if encType == "none" {
+		keyExchange := "rsa" // default to RSA staging
+		if keyExchangeParam, ok := msg.C2Profiles[0].Parameters["key_exchange"]; ok {
+			keyExchange = keyExchangeParam.(string)
+		}
+		if keyExchange == "rsa" {
+			finalEncMode = "rsa"
+		} else {
+			finalEncMode = "none" // no encryption
+		}
+	}
+
 	// Build ldflags for PubSub agent - these values will be injected at compile time
 	ldflags := "-s -w"
 	ldflags += fmt.Sprintf(" -X \"main.payloadID=%s\"", msg.PayloadUUID)
@@ -933,7 +950,7 @@ func buildPubSubAgent(msg structs.PayloadBuildMessage, response *structs.Payload
 	ldflags += fmt.Sprintf(" -X \"main.maxretry=%s\"", maxArg)
 	ldflags += fmt.Sprintf(" -X \"main.verbose=%t\"", verbose)
 	ldflags += fmt.Sprintf(" -X \"main.debug=%t\"", debug)
-	ldflags += fmt.Sprintf(" -X \"main.encryptionMode=%s\"", encType)
+	ldflags += fmt.Sprintf(" -X \"main.encryptionMode=%s\"", finalEncMode)
 	if encType == "aes256_hmac" && pubsubPSK != nil {
 		ldflags += fmt.Sprintf(" -X \"main.psk=%s\"", pubsubPSK)
 	}

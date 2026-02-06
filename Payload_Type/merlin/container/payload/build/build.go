@@ -933,6 +933,7 @@ func buildPubSubAgent(msg structs.PayloadBuildMessage, response *structs.Payload
 	ldflags += fmt.Sprintf(" -X \"main.maxretry=%s\"", maxArg)
 	ldflags += fmt.Sprintf(" -X \"main.verbose=%t\"", verbose)
 	ldflags += fmt.Sprintf(" -X \"main.debug=%t\"", debug)
+	ldflags += fmt.Sprintf(" -X \"main.encryptionMode=%s\"", encType)
 	if encType == "aes256_hmac" && pubsubPSK != nil {
 		ldflags += fmt.Sprintf(" -X \"main.psk=%s\"", pubsubPSK)
 	}

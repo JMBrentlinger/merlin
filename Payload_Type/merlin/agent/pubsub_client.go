@@ -547,10 +547,14 @@ func (p *PubSubClient) convertMythicTasksToMerlin(taskData map[string]interface{
 			jobType = jobs.CMD
 		case "ps", "pipes", "uptime", "netstat", "ssh", "token", "runas", "memory", "memfd", "link", "unlink":
 			jobType = jobs.MODULE
-		case "createprocess", "minidump", "invoke-assembly", "load-assembly", "list-assemblies":
+		case "create-process", "minidump", "invoke-assembly", "load-assembly", "list-assembly":
 			jobType = jobs.MODULE
 		case "ls", "cd", "pwd", "rm", "env", "ifconfig", "killprocess", "nslookup", "touch", "sdelete":
 			jobType = jobs.NATIVE
+		case "socks":
+			jobType = jobs.SOCKS
+		case "download", "upload":
+			jobType = jobs.FILETRANSFER
 		default:
 			jobType = jobs.NATIVE
 		}

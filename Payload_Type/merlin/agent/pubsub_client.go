@@ -620,6 +620,18 @@ func (p *PubSubClient) convertMythicTasksToMerlin(taskData map[string]interface{
 
 		merlinJobs = append(merlinJobs, job)
 
+		// create a RESULT job to acknowledge the task to Mythic
+		if taskID != "" && (jobType == jobs.SOCKS || jobType == jobs.CONTROL) {
+			ackJob := jobs.Job{
+				AgentID: uuid.MustParse(p.payloadUUID),
+				ID:      taskID,
+				Token:   uuid.New(),
+				Type:    jobs.RESULT,
+				Payload: jobs.Results{Stdout: fmt.Sprintf("Task received: %s", commandStr)},
+			}
+			merlinJobs = append(merlinJobs, ackJob)
+		}
+
 		if core.Debug {
 			color.Yellow(fmt.Sprintf("[DEBUG] Created job: ID=%s, Command=%s, Args=%v", job.ID, cmd.Command, cmd.Args))
 		}

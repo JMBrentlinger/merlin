@@ -838,7 +838,7 @@ func (p *PubSubClient) Listen() ([]messages.Base, error) {
 	}
 
 	if len(pendingJobs) == 0 {
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 	}
 
 	return pendingJobs, nil

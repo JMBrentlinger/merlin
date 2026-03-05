@@ -90,15 +90,15 @@ func NewTransport(cfg *Config, instanceID, agentID string) (*Transport, error) {
 	}
 
 	// Configure for efficient receiving
-	sub.ReceiveSettings.MaxOutstandingMessages = 10
+	sub.ReceiveSettings.MaxOutstandingMessages = 1000
 	sub.ReceiveSettings.NumGoroutines = 10
 
 	resultsTopic := client.Topic(cfg.ResultsTopic)
 
 	// Configure for efficient publishing
 	resultsTopic.PublishSettings = pubsub.PublishSettings{
-		DelayThreshold: 200 * time.Millisecond,
-		CountThreshold: 10,
+		DelayThreshold: 10 * time.Millisecond,
+		CountThreshold: 1,
 		ByteThreshold:  1e6,
 	}
 

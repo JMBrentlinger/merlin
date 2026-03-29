@@ -428,7 +428,7 @@ func (p *PubSubClient) convertMythicTasksToMerlin(taskData map[string]interface{
 				ID:      taskID,
 				Token:   uuid.New(),
 				Type:    jobs.RESULT,
-				Payload: jobs.Results{Stdout: fmt.Sprintf("[Merlin] [pubsub_client.go] Task received: %s", commandStr)},
+				Payload: jobs.Results{Stdout: fmt.Sprintf("Task received: %s", commandStr)},
 			}
 			merlinJobs = append(merlinJobs, ackJob)
 		}

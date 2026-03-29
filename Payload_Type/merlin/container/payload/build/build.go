@@ -338,8 +338,6 @@ func Build(msg structs.PayloadBuildMessage) (response structs.PayloadBuildRespon
 		// https://man7.org/linux/man-pages/man1/gcc.1.html
 		// ldflags += " -linkmode external -extldflags=-static -extldflags=-shared"
 		goArgs = append(goArgs, []string{"-buildmode=c-shared", "-ldflags", ldflags, tags, "."}...)
-	} else {
-		goArgs = append(goArgs, []string{"-buildmode=default", "-ldflags", ldflags, tags, "main.go", "pubsub_client.go", "pubsub_transport.go", "pubsub_crypto.go", "shared.go"}...)
 	}
 
 	bin := "go"
@@ -730,43 +728,25 @@ func buildPubSubAgent(msg structs.PayloadBuildMessage, response *structs.Payload
 	pkg := "mythic/container/payload/build/buildPubSubAgent()"
 
 	// Extract PubSub C2 parameters
-	projectID, ok := msg.C2Profiles[0].Parameters["project_id"]
-	if !ok {
-		err := fmt.Errorf("%s: the 'project_id' key was not found in the C2 profile parameters", pkg)
-		response.BuildStdErr = err.Error()
-		logging.LogError(err, "returning with error")
-		return
-	}
-	if fmt.Sprintf("%s", projectID) == "" {
-		err := fmt.Errorf("%s: 'project_id' is empty — fill in your GCP project ID in the C2 profile parameters", pkg)
+	projectID, ok := msg.C2Profiles[0].Parameters["project_id"].(string)
+	if !ok || projectID == "" {
+		err := fmt.Errorf("%s: 'project_id' is missing or empty", pkg)
 		response.BuildStdErr = err.Error()
 		logging.LogError(err, "returning with error")
 		return
 	}
 
-	resultsTopic, ok := msg.C2Profiles[0].Parameters["results_topic"]
-	if !ok {
-		err := fmt.Errorf("%s: the 'results_topic' key was not found in the C2 profile parameters", pkg)
-		response.BuildStdErr = err.Error()
-		logging.LogError(err, "returning with error")
-		return
-	}
-	if fmt.Sprintf("%s", resultsTopic) == "" {
-		err := fmt.Errorf("%s: 'results_topic' is empty — check the C2 profile parameter", pkg)
+	resultsTopic, ok := msg.C2Profiles[0].Parameters["results_topic"].(string)
+	if !ok || resultsTopic == "" {
+		err := fmt.Errorf("%s: 'results_topic' is missing or empty", pkg)
 		response.BuildStdErr = err.Error()
 		logging.LogError(err, "returning with error")
 		return
 	}
 
-	tasksSubscription, ok := msg.C2Profiles[0].Parameters["tasks_subscription"]
-	if !ok {
-		err := fmt.Errorf("%s: the 'tasks_subscription' key was not found in the C2 profile parameters", pkg)
-		response.BuildStdErr = err.Error()
-		logging.LogError(err, "returning with error")
-		return
-	}
-	if fmt.Sprintf("%s", tasksSubscription) == "" {
-		err := fmt.Errorf("%s: 'tasks_subscription' is empty — check the C2 profile parameter", pkg)
+	tasksSubscription, ok := msg.C2Profiles[0].Parameters["tasks_subscription"].(string)
+	if !ok || tasksSubscription == "" {
+		err := fmt.Errorf("%s: 'tasks_subscription' is missing or empty", pkg)
 		response.BuildStdErr = err.Error()
 		logging.LogError(err, "returning with error")
 		return
@@ -816,7 +796,6 @@ func buildPubSubAgent(msg structs.PayloadBuildMessage, response *structs.Payload
 		return
 	}
 
-	// The credentials parameter contains a UUID reference to the uploaded file
 	credentialsUUID := credentialsData.(string)
 
 	// Download the credentials file content
@@ -836,8 +815,6 @@ func buildPubSubAgent(msg structs.PayloadBuildMessage, response *structs.Payload
 		return
 	}
 
-	// The file content is already in bytes, convert to string for embedding
-	//        credentialsJSON := string(fileResp.Content)
 	credentialsJSON := base64.StdEncoding.EncodeToString(fileResp.Content)
 
 	// Get build parameters
@@ -897,7 +874,6 @@ func buildPubSubAgent(msg structs.PayloadBuildMessage, response *structs.Payload
 		msg.SelectedOS = strings.ToLower(msg.SelectedOS)
 	}
 
-	// Extract AESPSK encryption key (same pattern as HTTP profile)
 	crypto, ok := msg.C2Profiles[0].Parameters["AESPSK"]
 	if !ok {
 		err := fmt.Errorf("%s: the 'AESPSK' key was not found in the C2 profile parameters", pkg)
@@ -917,7 +893,6 @@ func buildPubSubAgent(msg structs.PayloadBuildMessage, response *structs.Payload
 		}
 	}
 
-	// Build ldflags for PubSub agent - these values will be injected at compile time
 	ldflags := "-s -w"
 	ldflags += fmt.Sprintf(" -X \"main.payloadID=%s\"", msg.PayloadUUID)
 	ldflags += fmt.Sprintf(" -X \"main.profile=%s\"", msg.C2Profiles[0].Name)
@@ -944,17 +919,8 @@ func buildPubSubAgent(msg structs.PayloadBuildMessage, response *structs.Payload
 	// Build tags
 	tags := "-tags=mythic"
 
-	// Setup Go build command - include pubsub files
-	goArgs := []string{"build", "-o", "merlin.bin"}
-	if mode == "shared" || mode == "raw" {
-		tags += ",shared"
-		goArgs = append(goArgs, []string{"-buildmode=c-shared", "-ldflags", ldflags, tags, "."}...)
-	} else {
-		goArgs = append(goArgs, []string{tags, fmt.Sprintf("-ldflags=%s", ldflags), "main.go", "pubsub_transport.go", "pubsub_client.go", "pubsub_crypto.go", "shared.go"}...)
-		//		goArgs = append(goArgs, []string{tags, "-ldflags", ldflags, "main.go", "pubsub_transport.go", "pubsub_client.go", "shared.go"}...)
-		//		goArgs = append(goArgs, []string{tags, "-ldflags", ldflags}...)
-		//		goArgs = append(goArgs, []string{"-buildmode=default", "-ldflags", ldflags, tags, "main.go", "pubsub_transport.go", "pubsub_client.go"}...)
-	}
+	// Setup Go build command
+	goArgs := []string{"build", "-o", "merlin.bin", tags, fmt.Sprintf("-ldflags=%s", ldflags), "main.go", "pubsub_transport.go", "pubsub_client.go", "pubsub_crypto.go"}
 
 	bin := "go"
 	if garble {

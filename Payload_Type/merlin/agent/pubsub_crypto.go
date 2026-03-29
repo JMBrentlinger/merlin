@@ -5,31 +5,12 @@ import (
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
-	"crypto/rsa"
-	"crypto/sha1"
 	"crypto/sha256"
-	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 )
-
-// generateRSAKeyPair generates a 4096-bit RSA key pair.
-// Returns the private key and the PKCS1 DER-encoded public key bytes.
-func generateRSAKeyPair() (*rsa.PrivateKey, []byte, error) {
-	privKey, err := rsa.GenerateKey(rand.Reader, 4096)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to generate RSA key pair: %w", err)
-	}
-	pubKeyDER := x509.MarshalPKCS1PublicKey(&privKey.PublicKey)
-	return privKey, pubKeyDER, nil
-}
-
-// rsaDecryptOAEP decrypts ciphertext using RSA OAEP with SHA1 (Mythic's default).
-func rsaDecryptOAEP(privKey *rsa.PrivateKey, ciphertext []byte) ([]byte, error) {
-	return rsa.DecryptOAEP(sha1.New(), rand.Reader, privKey, ciphertext, nil)
-}
 
 // pkcs7Pad pads data to a multiple of blockSize using PKCS7.
 func pkcs7Pad(data []byte, blockSize int) []byte {

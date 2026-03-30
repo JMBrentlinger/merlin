@@ -634,7 +634,7 @@ func (p *PubSubClient) Listen() ([]messages.Base, error) {
 										"task_id":     taskID,
 										"completed":   true,
 										"status":      "success",
-										"user_output": fmt.Sprintf("File uploaded: %s", pending.fullPath),
+										"user_output": fmt.Sprintf("File downloaded from victim: %s\nView it in 'Search Files'", pending.fullPath),
 										"download": map[string]interface{}{
 											"file_id":    fileID,
 											"chunk_num":  1,

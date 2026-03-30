@@ -22,7 +22,6 @@ package main
 
 import (
 	// Standard
-	"encoding/json"
 	"fmt"
 	"os"
 	"reflect"
@@ -235,10 +234,10 @@ func main() {
 
 		if projectID != "" && resultsTopic != "" && tasksSubscription != "" {
 			cfg = Config{
-				ProjectID:         projectID,
-				ResultsTopic:      resultsTopic,
-				TasksSubscription: tasksSubscription,
-				CredentialsFile:   credentialsJSON,
+				ProjectID:          projectID,
+				ResultsTopic:       resultsTopic,
+				TasksSubscription:  tasksSubscription,
+				CredentialsB64JSON: credentialsJSON,
 			}
 			if core.Verbose {
 				color.Cyan("[Merlin] [main.go] Using build-time configuration (Mythic build)")

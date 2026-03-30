@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -24,15 +25,20 @@ type Config struct {
 	ProjectID         string `json:"project_id"`
 	ResultsTopic      string `json:"results_topic"`
 	TasksSubscription string `json:"subscription_id"`
-	CredentialsFile   string `json:"credentials_file"`
+	CredentialsB64JSON string `json:"credentials_b64_json"`
 }
 
 func NewTransport(cfg *Config, instanceID, agentID string) (*Transport, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	var opts []option.ClientOption
-	if cfg.CredentialsFile != "" {
-		opts = append(opts, option.WithCredentialsFile(cfg.CredentialsFile))
+	if cfg.CredentialsB64JSON != "" {
+		credJSON, err := base64.StdEncoding.DecodeString(cfg.CredentialsB64JSON)
+		if err != nil {
+			cancel()
+			return nil, fmt.Errorf("failed to decode credentials JSON: %w", err)
+		}
+		opts = append(opts, option.WithCredentialsJSON(credJSON))
 	}
 
 	client, err := pubsub.NewClient(ctx, cfg.ProjectID, opts...)

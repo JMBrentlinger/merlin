@@ -36,7 +36,7 @@ func NewTransport(cfg *Config, instanceID, agentID string) (*Transport, error) {
 		credJSON, err := base64.StdEncoding.DecodeString(cfg.CredentialsB64JSON)
 		if err != nil {
 			cancel()
-			return nil, fmt.Errorf("failed to decode credentials JSON: %w", err)
+			return nil, fmt.Errorf("[Merlin] [pubsub_transport.go] failed to decode credentials JSON: %w", err)
 		}
 		opts = append(opts, option.WithCredentialsJSON(credJSON))
 	}
@@ -44,7 +44,7 @@ func NewTransport(cfg *Config, instanceID, agentID string) (*Transport, error) {
 	client, err := pubsub.NewClient(ctx, cfg.ProjectID, opts...)
 	if err != nil {
 		cancel()
-		return nil, err
+		return nil, fmt.Errorf("[Merlin] [pubsub_transport.go] failed to create Pub/Sub client: %w", err)
 	}
 
 	tasksSubscription := client.Subscription(cfg.TasksSubscription)
@@ -52,12 +52,12 @@ func NewTransport(cfg *Config, instanceID, agentID string) (*Transport, error) {
 	if err != nil {
 		cancel()
 		client.Close()
-		return nil, fmt.Errorf("failed to check subscription %s: %w", cfg.TasksSubscription, err)
+		return nil, fmt.Errorf("[Merlin] [pubsub_transport.go] failed to check subscription %s: %w", cfg.TasksSubscription, err)
 	}
 	if !exists {
 		cancel()
 		client.Close()
-		return nil, fmt.Errorf("subscription %s does not exist", cfg.TasksSubscription)
+		return nil, fmt.Errorf("[Merlin] [pubsub_transport.go] subscription %s does not exist", cfg.TasksSubscription)
 	}
 
 	tasksSubscription.ReceiveSettings = pubsub.ReceiveSettings{
@@ -120,7 +120,7 @@ func (t *Transport) SendRaw(base64Message string) error {
 	}
 	wrapperData, err := json.Marshal(wrapper)
 	if err != nil {
-		return fmt.Errorf("failed to marshal wrapper: %w", err)
+		return fmt.Errorf("[Merlin] [pubsub_transport.go] failed to marshal wrapper: %w", err)
 	}
 	result := t.topic.Publish(t.ctx, &pubsub.Message{Data: wrapperData})
 	_, err = result.Get(t.ctx)

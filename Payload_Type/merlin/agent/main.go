@@ -138,19 +138,19 @@ func setAgentID(a interface{}, newID uuid.UUID) error {
 
 	if fieldIndex == -1 {
 		if core.Verbose {
-			color.Yellow("[DEBUG] UUID field not found. Available fields:")
+			color.Yellow("[Merlin] [main.go] UUID field not found. Available fields:")
 			for i := 0; i < v.NumField(); i++ {
 				color.Yellow(fmt.Sprintf("  - %s (type: %s)", t.Field(i).Name, t.Field(i).Type))
 			}
 		}
-		return fmt.Errorf("UUID field not found in agent struct")
+		return fmt.Errorf("[Merlin] [main.go] UUID field not found in agent struct")
 	}
 
 	idField = reflect.NewAt(idField.Type(), unsafe.Pointer(idField.UnsafeAddr())).Elem()
 	idField.Set(reflect.ValueOf(newID))
 
 	if core.Verbose {
-		color.Cyan(fmt.Sprintf("[*] Agent UUID successfully set to payloadID: %s", newID.String()))
+		color.Cyan(fmt.Sprintf("[Merlin] [main.go] Agent UUID successfully set to payloadID: %s", newID.String()))
 	}
 
 	return nil
@@ -215,7 +215,7 @@ func main() {
 			clientConfig.Protocol = "http"
 		} else {
 			if core.Verbose {
-				color.Red("unable to detect valid protocol from URL: " + url)
+				color.Red("[Merlin] [main.go] Unable to detect valid protocol from URL: " + url)
 				os.Exit(1)
 			}
 		}
@@ -279,7 +279,7 @@ func main() {
 		}
 	default:
 		if core.Verbose {
-			color.Red(fmt.Sprintf("unknown C2 profile: %s", profile))
+			color.Red(fmt.Sprintf("[Merlin] [main.go] unknown C2 profile: %s", profile))
 		}
 		os.Exit(1)
 	}

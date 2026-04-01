@@ -2,7 +2,7 @@
   "mythic_version": "3.3",
   "agent_version": "2.4.1",
   "os": ["FreeBSD","macOS", "Linux", "OpenBSD","Solaris","Windows"],
-  "c2": ["http"],
+  "c2": ["http", "pubsub"],
   "payload_output": ["dll", "dylib","elf","exe","macho", "shellcode","so"],
   "architectures": ["x86","x86_64", "arm","arm_64","mips", "mips64"],
   "supported_wrappers": ["service_wrapper", "scarecrow_wrapper"],

